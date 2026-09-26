@@ -330,9 +330,178 @@ async def parse_xiaohongshu(source_url: str):
     }
 
 
+
+def extract_douyin_aweme_id(url: str) -> str | None:
+    patterns = (
+        r"/video/(\d+)",
+        r"/share/video/(\d+)",
+        r"[?&]modal_id=(\d+)",
+        r"[?&]aweme_id=(\d+)",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def find_douyin_item(state):
+    if not isinstance(state, (dict, list)):
+        return None
+
+    # Common SSR shape:
+    # loaderData -> <page> -> videoInfoRes -> item_list[0]
+    if isinstance(state, dict):
+        loader = state.get("loaderData")
+        if isinstance(loader, dict):
+            for page_data in loader.values():
+                if isinstance(page_data, dict):
+                    info = page_data.get("videoInfoRes")
+                    if isinstance(info, dict):
+                        items = info.get("item_list") or info.get("itemList")
+                        if isinstance(items, list) and items and isinstance(items[0], dict):
+                            return items[0]
+
+    # Fallback: look for a dict that has a video object and description.
+    for node in iter_nodes(state):
+        if not isinstance(node, dict):
+            continue
+        if isinstance(node.get("video"), dict) and (
+            node.get("desc") or node.get("aweme_id") or node.get("awemeId")
+        ):
+            return node
+
+    return None
+
+
+def douyin_item_to_result(item: dict, source_url: str, resolved_url: str):
+    video = item.get("video") or {}
+
+    urls = []
+    seen = set()
+
+    def add_urls(value, quality=None):
+        candidates = []
+        if isinstance(value, dict):
+            candidates = (
+                value.get("url_list")
+                or value.get("urlList")
+                or value.get("urls")
+                or []
+            )
+        elif isinstance(value, list):
+            candidates = value
+
+        for u in candidates:
+            if not isinstance(u, str):
+                continue
+            u = normalize_url(u)
+            if not u.startswith(("http://", "https://")) or u in seen:
+                continue
+            if not is_public_remote_url(u):
+                continue
+            seen.add(u)
+            urls.append({
+                "quality": quality or "公开视频源",
+                "url": u,
+                "ext": "mp4",
+                "width": video.get("width"),
+                "height": video.get("height"),
+            })
+
+    # Prefer the standard public playback address from the SSR payload.
+    add_urls(video.get("play_addr") or video.get("playAddr"), "公开播放源")
+
+    # Additional public variants, if present.
+    bit_rate = video.get("bit_rate") or video.get("bitRate") or []
+    if isinstance(bit_rate, list):
+        for br in bit_rate:
+            if not isinstance(br, dict):
+                continue
+            label = (
+                br.get("gear_name")
+                or br.get("gearName")
+                or br.get("quality_type")
+                or "视频源"
+            )
+            add_urls(br.get("play_addr") or br.get("playAddr"), str(label))
+
+    if not urls:
+        # Generic fallback against the item only.
+        urls = collect_media_urls(item, "douyin")
+
+    if not urls:
+        raise ValueError("已读取抖音公开 SSR 数据，但没有找到公开播放地址。")
+
+    author_obj = item.get("author") if isinstance(item.get("author"), dict) else {}
+    stats = item.get("statistics") if isinstance(item.get("statistics"), dict) else {}
+
+    cover = None
+    for key in ("cover", "origin_cover", "originCover", "dynamic_cover", "dynamicCover"):
+        obj = video.get(key)
+        if isinstance(obj, dict):
+            lst = obj.get("url_list") or obj.get("urlList") or []
+            if isinstance(lst, list) and lst:
+                cover = normalize_url(lst[0])
+                break
+
+    duration = video.get("duration") or item.get("duration")
+    if isinstance(duration, (int, float)) and duration > 10000:
+        duration = round(duration / 1000, 3)
+
+    return {
+        "platform": "Douyin",
+        "id": str(item.get("aweme_id") or item.get("awemeId") or ""),
+        "title": item.get("desc") or "抖音视频",
+        "author": (
+            author_obj.get("nickname")
+            or author_obj.get("unique_id")
+            or author_obj.get("uniqueId")
+        ),
+        "cover": cover,
+        "duration": duration,
+        "source_url": source_url,
+        "resolved_url": resolved_url,
+        "referer": resolved_url,
+        "videos": urls[:12],
+    }
+
+
 async def parse_douyin(source_url: str):
-    direct = await resolve_public_share(source_url)
-    final_url, page = await fetch_html(direct)
+    # 1) Resolve the public share link first.
+    resolved = await resolve_public_share(source_url)
+    aweme_id = extract_douyin_aweme_id(resolved) or extract_douyin_aweme_id(source_url)
+
+    # 2) Preferred public SSR path.
+    # This uses Douyin's public mobile share page and does not inject account
+    # cookies, solve CAPTCHAs, or bypass access control.
+    if aweme_id:
+        ssr_url = f"https://www.iesdouyin.com/share/video/{aweme_id}/?from_ssr=1"
+        try:
+            ssr_final, ssr_page = await fetch_html(
+                ssr_url,
+                referer="https://www.douyin.com/",
+            )
+
+            state = (
+                extract_balanced_json(ssr_page, "window._ROUTER_DATA")
+                or extract_balanced_json(ssr_page, "_ROUTER_DATA")
+                or extract_balanced_json(ssr_page, "__INITIAL_STATE__")
+            )
+
+            if state:
+                item = find_douyin_item(state)
+                if item:
+                    return douyin_item_to_result(
+                        item,
+                        source_url=source_url,
+                        resolved_url=ssr_final,
+                    )
+        except Exception:
+            pass
+
+    # 3) Fallback to the normal public page.
+    final_url, page = await fetch_html(resolved)
 
     if "/login" in final_url or "captcha" in final_url.lower():
         raise ValueError("抖音公开页面当前要求登录或验证码，未尝试绕过访问限制。")
@@ -353,33 +522,41 @@ async def parse_douyin(source_url: str):
             except Exception:
                 state = None
 
-    if not state:
-        raise ValueError("抖音页面已打开，但没有找到公开的页面状态数据。当前抖音可能已启用额外验证。")
+    if state:
+        item = find_douyin_item(state)
+        if item:
+            return douyin_item_to_result(
+                item,
+                source_url=source_url,
+                resolved_url=final_url,
+            )
 
-    videos = collect_media_urls(state, "douyin")
-    if not videos:
-        raise ValueError("已读取抖音公开页面，但没有找到可直接访问的视频资源。")
+        videos = collect_media_urls(state, "douyin")
+        if videos:
+            title = first_string_for_keys(state, ("desc", "title", "description"))
+            author = first_string_for_keys(state, ("nickname", "uniqueId", "unique_id", "name"))
+            cover = first_string_for_keys(state, ("cover", "coverUrl", "originCover", "dynamicCover"))
+            duration = first_number_for_keys(state, ("duration",))
+            if isinstance(duration, (int, float)) and duration > 10000:
+                duration = round(duration / 1000, 3)
 
-    title = first_string_for_keys(state, ("desc", "title", "description"))
-    author = first_string_for_keys(state, ("nickname", "uniqueId", "unique_id", "name"))
-    cover = first_string_for_keys(state, ("cover", "coverUrl", "originCover", "dynamicCover"))
-    duration = first_number_for_keys(state, ("duration",))
+            return {
+                "platform": "Douyin",
+                "id": first_string_for_keys(state, ("awemeId", "aweme_id", "id")),
+                "title": title or "抖音视频",
+                "author": author,
+                "cover": normalize_url(cover or "") or None,
+                "duration": duration,
+                "source_url": source_url,
+                "resolved_url": final_url,
+                "referer": final_url,
+                "videos": videos[:12],
+            }
 
-    if isinstance(duration, (int, float)) and duration > 10000:
-        duration = round(duration / 1000, 3)
-
-    return {
-        "platform": "Douyin",
-        "id": first_string_for_keys(state, ("awemeId", "aweme_id", "id")),
-        "title": title or "抖音视频",
-        "author": author,
-        "cover": normalize_url(cover or "") or None,
-        "duration": duration,
-        "source_url": source_url,
-        "resolved_url": final_url,
-        "referer": final_url,
-        "videos": videos[:12],
-    }
+    raise ValueError(
+        "已读取抖音公开页面，但没有找到可直接访问的视频资源。"
+        "该作品当前可能没有在公开 SSR 页面暴露播放地址。"
+    )
 
 
 def ytdlp_extract_sync(url: str):
