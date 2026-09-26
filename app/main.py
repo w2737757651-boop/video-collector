@@ -1,34 +1,3 @@
-import asyncio
-import re
-from pathlib import Path
-from urllib.parse import urlparse
-
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from yt_dlp import YoutubeDL
-
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-STATIC_DIR = BASE_DIR / "static"
-
-app = FastAPI(title="Video Collector", version="1.0")
-
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-ALLOWED_HOST_PARTS = (
-    "douyin.com",
-    "xiaohongshu.com",
-    "xhslink.com",
-    "kuaishou.com",
-    "bilibili.com",
-    "b23.tv",
-    "weixin.qq.com",
-)
-
-URL_RE = re.compile(r'https?://[^\s<>"\']+', re.I)
-
 
 class ParseBody(BaseModel):
     text: str
