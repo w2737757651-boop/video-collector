@@ -16,7 +16,7 @@ from yt_dlp import YoutubeDL
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 
-app = FastAPI(title="Video Collector", version="2.0")
+app = FastAPI(title="Video Collector", version="2.2")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 URL_RE = re.compile(r'https?://[^\s<>"\']+', re.I)
@@ -467,14 +467,94 @@ def douyin_item_to_result(item: dict, source_url: str, resolved_url: str):
     }
 
 
+
+async def fetch_douyin_mobile_feed_item(aweme_id: str):
+    """
+    Query Douyin's mobile feed endpoints for a public video ID.
+    No account cookies, CAPTCHA solving, or access-control bypass is used.
+    """
+    endpoints = (
+        "https://api5-normal-c-hl.amemv.com/aweme/v1/feed/",
+        "https://aweme.snssdk.com/aweme/v1/feed/",
+    )
+
+    headers = {
+        "User-Agent": (
+            "com.ss.android.ugc.aweme/280500 "
+            "(Linux; U; Android 13; zh_CN; Pixel 7; Build/TQ3A.230805.001)"
+        ),
+        "Accept": "application/json",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
+
+    params = {
+        "aweme_id": aweme_id,
+        "aid": "1128",
+    }
+
+    last_error = None
+
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=20,
+        headers=headers,
+        http2=True,
+    ) as client:
+        for endpoint in endpoints:
+            try:
+                r = await client.get(endpoint, params=params)
+                if r.status_code >= 400:
+                    last_error = f"{endpoint} HTTP {r.status_code}"
+                    continue
+
+                data = r.json()
+
+                candidates = []
+                if isinstance(data, dict):
+                    for key in ("aweme_list", "item_list", "awemeList", "itemList"):
+                        value = data.get(key)
+                        if isinstance(value, list):
+                            candidates.extend(value)
+
+                for item in candidates:
+                    if not isinstance(item, dict):
+                        continue
+                    iid = str(item.get("aweme_id") or item.get("awemeId") or "")
+                    if iid == aweme_id:
+                        return item
+
+                # Some responses contain only one result without an exact id match.
+                for item in candidates:
+                    if isinstance(item, dict) and isinstance(item.get("video"), dict):
+                        return item
+
+                last_error = f"{endpoint} 返回成功但未找到作品"
+            except Exception as e:
+                last_error = str(e)
+
+    if last_error:
+        raise ValueError("抖音移动端 Feed 未返回视频数据：" + last_error)
+    raise ValueError("抖音移动端 Feed 未返回视频数据")
+
+
 async def parse_douyin(source_url: str):
-    # 1) Resolve the public share link first.
+    # Resolve share URL and get public video id.
     resolved = await resolve_public_share(source_url)
     aweme_id = extract_douyin_aweme_id(resolved) or extract_douyin_aweme_id(source_url)
 
-    # 2) Preferred public SSR path.
-    # This uses Douyin's public mobile share page and does not inject account
-    # cookies, solve CAPTCHAs, or bypass access control.
+    # 1) Main path: mobile Feed API for ordinary public videos.
+    if aweme_id:
+        try:
+            item = await fetch_douyin_mobile_feed_item(aweme_id)
+            return douyin_item_to_result(
+                item,
+                source_url=source_url,
+                resolved_url=resolved,
+            )
+        except Exception:
+            pass
+
+    # 2) Fallback: public mobile SSR share page.
     if aweme_id:
         ssr_url = f"https://www.iesdouyin.com/share/video/{aweme_id}/?from_ssr=1"
         try:
@@ -500,7 +580,7 @@ async def parse_douyin(source_url: str):
         except Exception:
             pass
 
-    # 3) Fallback to the normal public page.
+    # 3) Last public-page fallback.
     final_url, page = await fetch_html(resolved)
 
     if "/login" in final_url or "captcha" in final_url.lower():
@@ -554,8 +634,8 @@ async def parse_douyin(source_url: str):
             }
 
     raise ValueError(
-        "已读取抖音公开页面，但没有找到可直接访问的视频资源。"
-        "该作品当前可能没有在公开 SSR 页面暴露播放地址。"
+        "抖音公开 Feed、SSR 和普通公开页面均未返回可直接访问的视频资源。"
+        "该作品当前可能受到地区、内容类型或平台访问策略限制。"
     )
 
 
@@ -653,7 +733,7 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "version": "2.0"}
+    return {"ok": True, "version": "2.2"}
 
 
 @app.post("/api/parse")
