@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: video-collector
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
