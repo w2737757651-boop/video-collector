@@ -45,10 +45,7 @@ BASE_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-PRIVATE_NETS = (
-    "127.", "10.", "192.168.", "169.254.",
-    "0.", "224.", "240.",
-)
+PRIVATE_NETS = ("127.", "10.", "192.168.", "169.254.", "0.", "224.", "240.")
 
 
 class ParseBody(BaseModel):
@@ -95,7 +92,6 @@ def is_public_remote_url(url: str) -> bool:
         host = p.hostname.lower()
         if host == "localhost" or any(host.startswith(x) for x in PRIVATE_NETS):
             return False
-        # Block obvious literal private IPv6/IPv4 targets.
         try:
             ip = socket.gethostbyname(host)
             if (
@@ -103,7 +99,7 @@ def is_public_remote_url(url: str) -> bool:
                 or ip.startswith("10.")
                 or ip.startswith("192.168.")
                 or ip.startswith("169.254.")
-                or ip.startswith("172.") and 16 <= int(ip.split(".")[1]) <= 31
+                or (ip.startswith("172.") and 16 <= int(ip.split(".")[1]) <= 31)
             ):
                 return False
         except Exception:
@@ -132,15 +128,12 @@ def extract_balanced_json(text: str, marker: str):
     pos = text.find(marker)
     if pos < 0:
         return None
-
-    # Find the first JSON object/array after the marker.
     start_obj = text.find("{", pos + len(marker))
     start_arr = text.find("[", pos + len(marker))
     candidates = [x for x in (start_obj, start_arr) if x >= 0]
     if not candidates:
         return None
     start = min(candidates)
-
     opening = text[start]
     closing = "}" if opening == "{" else "]"
     depth = 0
@@ -165,8 +158,7 @@ def extract_balanced_json(text: str, marker: str):
         elif ch == closing:
             depth -= 1
             if depth == 0:
-                raw = text[start:i + 1]
-                raw = re.sub(r"\bundefined\b", "null", raw)
+                raw = re.sub(r"\bundefined\b", "null", text[start:i + 1])
                 try:
                     return json.loads(raw)
                 except Exception:
@@ -217,14 +209,14 @@ def collect_media_urls(obj, platform: str):
                 "xhscdn.com" in low
                 or "sns-video" in low
                 or ".mp4" in low
-                or "video" in low and "xhs" in low
+                or ("video" in low and "xhs" in low)
             )
         elif platform == "douyin":
             likely = (
                 ".mp4" in low
                 or "douyinvod" in low
                 or "bytev" in low
-                or "video" in low and ("douyin" in low or "snssdk" in low)
+                or ("video" in low and ("douyin" in low or "snssdk" in low))
             )
         else:
             likely = ".mp4" in low or ".m3u8" in low
@@ -264,7 +256,6 @@ def collect_media_urls(obj, platform: str):
                     if isinstance(item, str):
                         add(item, width, height)
 
-    # Prefer larger known resolutions and then keep stable insertion order.
     found.sort(key=lambda x: ((x.get("height") or 0), (x.get("width") or 0)), reverse=True)
     return found
 
@@ -285,11 +276,6 @@ def platform_from_url(url: str) -> str:
 
 
 async def resolve_public_share(url: str) -> str:
-    """
-    Resolve a public share link. If Xiaohongshu redirects to a login page that
-    includes the original public note in redirectPath, recover that target URL.
-    This does not bypass the login page or use account credentials.
-    """
     headers = dict(BASE_HEADERS)
     async with httpx.AsyncClient(follow_redirects=True, timeout=20, headers=headers) as client:
         r = await client.get(url)
@@ -358,7 +344,6 @@ async def parse_douyin(source_url: str):
         or extract_balanced_json(page, "__UNIVERSAL_DATA_FOR_REHYDRATION__")
     )
 
-    # Older Douyin pages may embed percent-encoded RENDER_DATA.
     if not state:
         m = re.search(r'id=["\']RENDER_DATA["\'][^>]*>(.*?)</script>', page, re.S | re.I)
         if m:
@@ -369,10 +354,7 @@ async def parse_douyin(source_url: str):
                 state = None
 
     if not state:
-        raise ValueError(
-            "抖音页面已打开，但没有找到公开的页面状态数据。"
-            "当前抖音可能已对该链接启用额外验证。"
-        )
+        raise ValueError("抖音页面已打开，但没有找到公开的页面状态数据。当前抖音可能已启用额外验证。")
 
     videos = collect_media_urls(state, "douyin")
     if not videos:
@@ -383,7 +365,6 @@ async def parse_douyin(source_url: str):
     cover = first_string_for_keys(state, ("cover", "coverUrl", "originCover", "dynamicCover"))
     duration = first_number_for_keys(state, ("duration",))
 
-    # Douyin durations are sometimes milliseconds.
     if isinstance(duration, (int, float)) and duration > 10000:
         duration = round(duration / 1000, 3)
 
@@ -467,7 +448,6 @@ async def parse_any(source_url: str):
     validate_source_url(source_url)
     platform = platform_from_url(source_url)
 
-    # Platform adapters first. yt-dlp is only the fallback.
     if platform == "douyin":
         try:
             return await parse_douyin(source_url)
@@ -505,8 +485,6 @@ async def parse_video(body: ParseBody):
         source_url = extract_url(body.text)
         data = await parse_any(source_url)
 
-        # Use a server-side download route. The source URL is reparsed by the
-        # server, so the client cannot choose an arbitrary internal URL.
         for i, item in enumerate(data.get("videos") or []):
             item["download_url"] = (
                 "/api/download?source="
