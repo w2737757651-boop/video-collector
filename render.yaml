@@ -4,4 +4,4 @@ services:
     runtime: docker
     plan: free
     healthCheckPath: /health
-    autoDeploy: true
+    autoDeployTrigger: commit
