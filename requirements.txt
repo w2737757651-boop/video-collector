@@ -1,4 +1,4 @@
 fastapi
 uvicorn[standard]
 yt-dlp
-httpx
+httpx[http2]
