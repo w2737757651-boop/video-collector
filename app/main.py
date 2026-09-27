@@ -19,7 +19,7 @@ from playwright.async_api import async_playwright
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 
-app = FastAPI(title="Video Collector", version="4.1.1")
+app = FastAPI(title="Video Collector", version="4.2")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 _PARSE_CACHE = {}
@@ -52,6 +52,63 @@ def _cache_set(key, value):
 _XHS_PLAYWRIGHT = None
 _XHS_BROWSER = None
 _XHS_BROWSER_LOCK = asyncio.Lock()
+
+
+# In-flight parse jobs.
+# Repeated clicks for the same URL attach to the same background task
+# instead of restarting the whole extraction pipeline.
+_PARSE_INFLIGHT = {}
+_PARSE_ERROR_CACHE = {}
+_PARSE_ERROR_TTL = 30
+
+
+def _error_cache_get(key):
+    item = _PARSE_ERROR_CACHE.get(key)
+    if not item:
+        return None
+
+    expires_at, message = item
+    if time.time() >= expires_at:
+        _PARSE_ERROR_CACHE.pop(key, None)
+        return None
+
+    return message
+
+
+def _error_cache_set(key, message):
+    _PARSE_ERROR_CACHE[key] = (
+        time.time() + _PARSE_ERROR_TTL,
+        str(message)[:1800],
+    )
+
+
+async def _parse_job(source_url: str):
+    try:
+        data = await parse_any(source_url)
+        _cache_set(source_url, data)
+        _PARSE_ERROR_CACHE.pop(source_url, None)
+        return data
+    except Exception as exc:
+        _error_cache_set(source_url, exc)
+        raise
+
+
+def _get_or_create_parse_task(source_url: str):
+    task = _PARSE_INFLIGHT.get(source_url)
+
+    if task is not None and not task.done():
+        return task, False
+
+    task = asyncio.create_task(_parse_job(source_url))
+    _PARSE_INFLIGHT[source_url] = task
+
+    def _cleanup(done_task):
+        current = _PARSE_INFLIGHT.get(source_url)
+        if current is done_task:
+            _PARSE_INFLIGHT.pop(source_url, None)
+
+    task.add_done_callback(_cleanup)
+    return task, True
 
 
 async def _get_xhs_browser():
@@ -1512,29 +1569,50 @@ async def fetch_douyin_mobile_feed_item(aweme_id: str):
 
 
 async def parse_douyin(source_url: str):
-    # Resolve share URL and get public video id.
-    resolved = await resolve_public_share(source_url)
-    aweme_id = extract_douyin_aweme_id(resolved) or extract_douyin_aweme_id(source_url)
+    """
+    Fast Douyin path with strict stage budgets.
+    Ordinary public videos should finish through the mobile feed path.
+    """
+    resolved = await asyncio.wait_for(
+        resolve_public_share(source_url),
+        timeout=3.0,
+    )
 
-    # 1) Main path: mobile Feed API for ordinary public videos.
+    aweme_id = (
+        extract_douyin_aweme_id(resolved)
+        or extract_douyin_aweme_id(source_url)
+    )
+
+    errors = []
+
+    # 1) Fastest/public mobile feed path.
     if aweme_id:
         try:
-            item = await fetch_douyin_mobile_feed_item(aweme_id)
+            item = await asyncio.wait_for(
+                fetch_douyin_mobile_feed_item(aweme_id),
+                timeout=4.0,
+            )
             return douyin_item_to_result(
                 item,
                 source_url=source_url,
                 resolved_url=resolved,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            errors.append("Feed: " + str(exc))
 
-    # 2) Fallback: public mobile SSR share page.
+    # 2) Lightweight public SSR fallback.
     if aweme_id:
-        ssr_url = f"https://www.iesdouyin.com/share/video/{aweme_id}/?from_ssr=1"
         try:
-            ssr_final, ssr_page = await fetch_html(
-                ssr_url,
-                referer="https://www.douyin.com/",
+            ssr_url = (
+                f"https://www.iesdouyin.com/share/video/{aweme_id}/?from_ssr=1"
+            )
+
+            ssr_final, ssr_page = await asyncio.wait_for(
+                fetch_html(
+                    ssr_url,
+                    referer="https://www.douyin.com/",
+                ),
+                timeout=3.5,
             )
 
             state = (
@@ -1551,374 +1629,16 @@ async def parse_douyin(source_url: str):
                         source_url=source_url,
                         resolved_url=ssr_final,
                     )
-        except Exception:
-            pass
 
-    # 3) Last public-page fallback.
-    final_url, page = await fetch_html(resolved)
+            errors.append("SSR: 未找到公开视频数据")
 
-    if "/login" in final_url or "captcha" in final_url.lower():
-        raise ValueError("抖音公开页面当前要求登录或验证码，未尝试绕过访问限制。")
-
-    state = (
-        extract_balanced_json(page, "window._ROUTER_DATA")
-        or extract_balanced_json(page, "_ROUTER_DATA")
-        or extract_balanced_json(page, "__INITIAL_STATE__")
-        or extract_balanced_json(page, "__UNIVERSAL_DATA_FOR_REHYDRATION__")
-    )
-
-    if not state:
-        m = re.search(r'id=["\']RENDER_DATA["\'][^>]*>(.*?)</script>', page, re.S | re.I)
-        if m:
-            try:
-                raw = unquote(html.unescape(m.group(1)))
-                state = json.loads(raw)
-            except Exception:
-                state = None
-
-    if state:
-        item = find_douyin_item(state)
-        if item:
-            return douyin_item_to_result(
-                item,
-                source_url=source_url,
-                resolved_url=final_url,
-            )
-
-        videos = collect_media_urls(state, "douyin")
-        if videos:
-            title = first_string_for_keys(state, ("desc", "title", "description"))
-            author = first_string_for_keys(state, ("nickname", "uniqueId", "unique_id", "name"))
-            cover = first_string_for_keys(state, ("cover", "coverUrl", "originCover", "dynamicCover"))
-            duration = first_number_for_keys(state, ("duration",))
-            if isinstance(duration, (int, float)) and duration > 10000:
-                duration = round(duration / 1000, 3)
-
-            return {
-                "platform": "Douyin",
-                "id": first_string_for_keys(state, ("awemeId", "aweme_id", "id")),
-                "title": title or "抖音视频",
-                "author": author,
-                "cover": normalize_url(cover or "") or None,
-                "duration": duration,
-                "source_url": source_url,
-                "resolved_url": final_url,
-                "referer": final_url,
-                "videos": videos[:12],
-            }
+        except Exception as exc:
+            errors.append("SSR: " + str(exc))
 
     raise ValueError(
-        "抖音公开 Feed、SSR 和普通公开页面均未返回可直接访问的视频资源。"
-        "该作品当前可能受到地区、内容类型或平台访问策略限制。"
+        "抖音快速解析失败。"
+        + ("；".join(errors) if errors else "未取得公开视频数据")
     )
-
-
-
-def extract_wechat_direct_urls_from_html(page: str):
-    """
-    Extract media URLs already exposed by the public share page.
-    No login/session credentials are injected.
-    """
-    candidates = []
-    seen = set()
-
-    # Normalize common escaping styles first.
-    normalized = (
-        html.unescape(page)
-        .replace("\\u002F", "/")
-        .replace("\\/", "/")
-        .replace("&amp;", "&")
-    )
-
-    patterns = (
-        r'https?://finder\.video\.qq\.com/[^\s"\'<>]+',
-        r'https?://[^\s"\'<>]+\.video\.qq\.com/[^\s"\'<>]+',
-        r'https?://[^\s"\'<>]+\.mp4(?:\?[^\s"\'<>]*)?',
-        r'https?://[^\s"\'<>]+\.m3u8(?:\?[^\s"\'<>]*)?',
-    )
-
-    for pattern in patterns:
-        for m in re.finditer(pattern, normalized, re.I):
-            url = normalize_url(m.group(0)).rstrip('",);]')
-            if not url.startswith(("http://", "https://")):
-                continue
-            if not is_public_remote_url(url):
-                continue
-            if url in seen:
-                continue
-            seen.add(url)
-            candidates.append({
-                "quality": "公开视频源",
-                "url": url,
-                "ext": "m3u8" if ".m3u8" in url.lower() else "mp4",
-                "width": None,
-                "height": None,
-            })
-
-    return candidates
-
-
-
-WECHAT_THIRD_PARTY_RESOLVER = (
-    "https://sph.litao.workers.dev/api/fetch_video_profile"
-)
-
-
-async def parse_wechat_via_third_party(source_url: str):
-    """
-    Third-party fallback for WeChat Channels share links.
-
-    Only the share URL is sent to the resolver.
-    No local WeChat cookies, passwords, or login session are sent.
-    """
-    payload = {"url": source_url}
-
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": UA,
-        "Accept": "application/json",
-    }
-
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=30,
-        headers=headers,
-        http2=True,
-    ) as client:
-        response = await client.post(
-            WECHAT_THIRD_PARTY_RESOLVER,
-            json=payload,
-        )
-
-        if response.status_code >= 400:
-            raise ValueError(
-                "视频号第三方解析服务返回 HTTP "
-                + str(response.status_code)
-            )
-
-        try:
-            data = response.json()
-        except Exception:
-            raise ValueError(
-                "视频号第三方解析服务返回了非 JSON 数据。"
-            )
-
-    if not isinstance(data, dict):
-        raise ValueError(
-            "视频号第三方解析服务返回格式异常。"
-        )
-
-    err_code = data.get("errCode")
-    err_msg = data.get("errMsg")
-
-    if err_code not in (None, 0, "0"):
-        raise ValueError(
-            "视频号第三方解析失败："
-            + str(err_msg or err_code)
-        )
-
-    root = data.get("data")
-    if not isinstance(root, dict):
-        root = {}
-
-    feed_info = root.get("feedInfo")
-    if not isinstance(feed_info, dict):
-        feed_info = {}
-
-    author_info = root.get("authorInfo")
-    if not isinstance(author_info, dict):
-        author_info = {}
-
-    video_url = (
-        feed_info.get("videoUrl")
-        or feed_info.get("video_url")
-        or feed_info.get("url")
-    )
-
-    if not isinstance(video_url, str) or not video_url.strip():
-        raise ValueError(
-            "视频号第三方解析服务没有返回可下载的视频地址。"
-        )
-
-    video_url = normalize_url(video_url.strip())
-
-    if not is_public_remote_url(video_url):
-        raise ValueError(
-            "视频号第三方解析服务返回的视频地址无效。"
-        )
-
-    title = (
-        feed_info.get("description")
-        or feed_info.get("desc")
-        or feed_info.get("title")
-        or "视频号视频"
-    )
-
-    author = (
-        author_info.get("nickname")
-        or author_info.get("name")
-        or author_info.get("username")
-        or feed_info.get("nickname")
-    )
-
-    cover = (
-        feed_info.get("coverUrl")
-        or feed_info.get("cover")
-        or feed_info.get("thumbUrl")
-        or feed_info.get("poster")
-    )
-
-    duration = (
-        feed_info.get("duration")
-        or feed_info.get("videoDuration")
-    )
-
-    video_id = (
-        feed_info.get("objectId")
-        or feed_info.get("feedId")
-        or feed_info.get("id")
-    )
-
-    return {
-        "platform": "WeChatChannels",
-        "id": str(video_id) if video_id is not None else None,
-        "title": str(title),
-        "author": str(author) if author else None,
-        "cover": normalize_url(cover or "") or None,
-        "duration": duration,
-        "source_url": source_url,
-        "resolved_url": source_url,
-        "referer": "https://weixin.qq.com/",
-        "videos": [
-            {
-                "quality": "视频号直链",
-                "url": video_url,
-                "ext": (
-                    "m3u8"
-                    if ".m3u8" in video_url.lower()
-                    else "mp4"
-                ),
-                "width": None,
-                "height": None,
-            }
-        ],
-        "resolver": "third_party",
-    }
-
-
-async def parse_wechat_channels(source_url: str):
-    """
-    Public-page-only WeChat Channels parser.
-
-    Supports public share pages such as:
-      - https://weixin.qq.com/sph/...
-      - https://mp.weixin.qq.com/sph/...
-      - channels.weixin.qq.com public pages
-
-    If the public page does not expose a media URL, return a clear authorization
-    boundary instead of using account cookies or bypassing login.
-    """
-    final_url, page = await fetch_html(
-        source_url,
-        referer="https://weixin.qq.com/",
-    )
-
-    low_final = final_url.lower()
-    low_page = page.lower()
-
-    if (
-        "/login" in low_final
-        or "captcha" in low_final
-        or "verify" in low_final
-        or "请在微信客户端打开" in page
-    ):
-        raise ValueError(
-            "视频号公开页面当前要求微信客户端、登录或验证；未尝试绕过访问限制。"
-        )
-
-    # 1) Direct media URLs exposed in the page source.
-    videos = extract_wechat_direct_urls_from_html(page)
-
-    # 2) Common embedded state blobs.
-    states = []
-    for marker_name in (
-        "window.__INITIAL_STATE__",
-        "__INITIAL_STATE__",
-        "__NEXT_DATA__",
-        "window.cgiData",
-        "cgiData",
-        "feedInfo",
-    ):
-        state = extract_balanced_json(page, marker_name)
-        if state:
-            states.append(state)
-
-    for state in states:
-        for item in collect_media_urls(state, "wechat"):
-            if all(item["url"] != x["url"] for x in videos):
-                videos.append(item)
-
-    if not videos:
-        raise ValueError(
-            "已读取视频号公开分享页面，但页面没有暴露可直接访问的视频资源。"
-            "当前该链接可能需要微信登录/授权会话；本工具不会注入或绕过账号凭证。"
-        )
-
-    merged_state = states[0] if states else {}
-
-    title = first_string_for_keys(
-        merged_state,
-        ("title", "desc", "description", "feedDesc", "nickname"),
-    ) if merged_state else None
-
-    author = first_string_for_keys(
-        merged_state,
-        ("nickname", "authorName", "finderUsername", "username", "name"),
-    ) if merged_state else None
-
-    cover = first_string_for_keys(
-        merged_state,
-        ("cover", "coverUrl", "thumbUrl", "imageUrl", "poster"),
-    ) if merged_state else None
-
-    duration = first_number_for_keys(
-        merged_state,
-        ("duration", "videoDuration"),
-    ) if merged_state else None
-
-    return {
-        "platform": "WeChatChannels",
-        "id": (
-            first_string_for_keys(
-                merged_state,
-                ("objectId", "feedId", "id"),
-            )
-            if merged_state else None
-        ),
-        "title": title or "视频号视频",
-        "author": author,
-        "cover": normalize_url(cover or "") or None,
-        "duration": duration,
-        "source_url": source_url,
-        "resolved_url": final_url,
-        "referer": final_url,
-        "videos": videos[:12],
-    }
-
-
-def ytdlp_extract_sync(url: str):
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "extract_flat": False,
-        "socket_timeout": 20,
-        "retries": 1,
-        "fragment_retries": 1,
-    }
-    with YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
 
 
 async def parse_with_ytdlp(url: str):
@@ -2011,36 +1731,54 @@ async def parse_any(source_url: str):
     platform = platform_from_url(source_url)
 
     if platform == "douyin":
+        adapter_error = None
+
         try:
-            return await parse_douyin(source_url)
-        except Exception as adapter_error:
-            try:
-                return await parse_with_ytdlp(source_url)
-            except Exception:
-                raise ValueError(str(adapter_error))
+            return await asyncio.wait_for(
+                parse_douyin(source_url),
+                timeout=8.5,
+            )
+        except Exception as exc:
+            adapter_error = str(exc)
+
+        # Short fallback only; do not let yt-dlp turn a fast request
+        # into a long-running request.
+        try:
+            return await asyncio.wait_for(
+                parse_with_ytdlp(source_url),
+                timeout=5.0,
+            )
+        except Exception:
+            raise ValueError(adapter_error)
 
     if platform == "xiaohongshu":
-        try:
-            return await parse_xiaohongshu(source_url)
-        except Exception as adapter_error:
-            try:
-                return await parse_with_ytdlp(source_url)
-            except Exception:
-                raise ValueError(str(adapter_error))
+        # The XHS adapter already contains strict HTTP/browser stages.
+        # Do not run yt-dlp again after browser failure; that only adds
+        # latency for the same anonymous page limitation.
+        return await parse_xiaohongshu(source_url)
 
     if platform == "wechat":
         public_error = None
 
         try:
-            return await parse_wechat_channels(source_url)
+            return await asyncio.wait_for(
+                parse_wechat_channels(source_url),
+                timeout=7.0,
+            )
         except Exception as exc:
             public_error = str(exc)
 
         try:
-            return await parse_wechat_via_third_party(source_url)
+            return await asyncio.wait_for(
+                parse_wechat_via_third_party(source_url),
+                timeout=7.0,
+            )
         except Exception as third_party_error:
             try:
-                return await parse_with_ytdlp(source_url)
+                return await asyncio.wait_for(
+                    parse_with_ytdlp(source_url),
+                    timeout=5.0,
+                )
             except Exception:
                 raise ValueError(
                     "视频号公开页面解析失败："
@@ -2049,7 +1787,10 @@ async def parse_any(source_url: str):
                     + str(third_party_error)
                 )
 
-    return await parse_with_ytdlp(source_url)
+    return await asyncio.wait_for(
+        parse_with_ytdlp(source_url),
+        timeout=10.0,
+    )
 
 
 @app.get("/")
@@ -2059,7 +1800,7 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "version": "4.1.1"}
+    return {"ok": True, "version": "4.2"}
 
 
 @app.post("/api/parse")
@@ -2068,15 +1809,69 @@ async def parse_video(body: ParseBody):
         source_url = extract_url(body.text)
         validate_source_url(source_url)
 
+        # 1) Completed result cache: immediate return.
         data = _cache_get(source_url)
 
-        if data is None:
-            # Overall server-side cap. Xiaohongshu has its own shorter stages.
+        if data is not None:
+            for i, item in enumerate(data.get("videos") or []):
+                item["download_url"] = (
+                    "/api/download?source="
+                    + quote(source_url, safe="")
+                    + "&kind=video&index="
+                    + str(i)
+                )
+
+            for i, item in enumerate(data.get("audios") or []):
+                item["download_url"] = (
+                    "/api/download?source="
+                    + quote(source_url, safe="")
+                    + "&kind=audio&index="
+                    + str(i)
+                )
+
+            return {
+                "success": True,
+                "data": data,
+                "cache": "hit",
+            }
+
+        # 2) Recent definitive failure: don't restart the same expensive job.
+        recent_error = _error_cache_get(source_url)
+        if recent_error is not None:
+            return {
+                "success": False,
+                "pending": False,
+                "error": recent_error,
+            }
+
+        # 3) Start or attach to one shared background task.
+        task, created = _get_or_create_parse_task(source_url)
+
+        try:
+            # The HTTP request only waits a short window.
+            # The extraction task itself is shielded and keeps running.
             data = await asyncio.wait_for(
-                parse_any(source_url),
-                timeout=18.0,
+                asyncio.shield(task),
+                timeout=7.0,
             )
-            _cache_set(source_url, data)
+
+        except asyncio.TimeoutError:
+            return {
+                "success": False,
+                "pending": True,
+                "error": (
+                    "解析仍在后台继续。"
+                    "请等待约 5 秒后再次点击“开始解析”；"
+                    "下次会承接当前任务，不会重新开始。"
+                ),
+            }
+
+        except Exception as exc:
+            return {
+                "success": False,
+                "pending": False,
+                "error": str(exc)[:1800],
+            }
 
         for i, item in enumerate(data.get("videos") or []):
             item["download_url"] = (
@@ -2094,18 +1889,17 @@ async def parse_video(body: ParseBody):
                 + str(i)
             )
 
-        return {"success": True, "data": data}
-
-    except asyncio.TimeoutError:
         return {
-            "success": False,
-            "error": "解析超过 18 秒，服务器已主动停止本次任务。",
+            "success": True,
+            "data": data,
+            "cache": "new" if created else "inflight",
         }
 
-    except Exception as e:
+    except Exception as exc:
         return {
             "success": False,
-            "error": str(e)[:1800],
+            "pending": False,
+            "error": str(exc)[:1800],
         }
 
 
