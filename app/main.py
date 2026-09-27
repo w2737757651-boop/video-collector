@@ -16,7 +16,7 @@ from yt_dlp import YoutubeDL
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 
-app = FastAPI(title="Video Collector", version="2.4")
+app = FastAPI(title="Video Collector", version="2.8")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 URL_RE = re.compile(r'https?://[^\s<>"\']+', re.I)
@@ -307,9 +307,373 @@ async def resolve_public_share(url: str) -> str:
     return final_url
 
 
+
+def _xhs_is_video_url(url: str) -> bool:
+    if not isinstance(url, str):
+        return False
+    url = normalize_url(url).strip()
+    if not url.startswith(("http://", "https://")):
+        return False
+    low = url.lower()
+    blocked_ext = ('.jpg','.jpeg','.png','.webp','.gif','.avif','.bmp','.svg')
+    if any(ext in low for ext in blocked_ext):
+        return False
+    blocked_tokens = ('imageview','imageprocess','thumbnail','thumb','cover','avatar','logo','banner','advert','adsystem','/ads/','spectrum/')
+    if any(token in low for token in blocked_tokens):
+        return False
+    positive_tokens = ('.mp4','.m3u8','sns-video','sns_video','video-stream','video_stream','/video/')
+    return any(token in low for token in positive_tokens)
+
+
+def collect_xhs_video_urls(state):
+    results=[]
+    seen=set()
+    def add(url, quality=None, width=None, height=None):
+        if not isinstance(url,str): return
+        url=normalize_url(url)
+        if not _xhs_is_video_url(url): return
+        if not is_public_remote_url(url): return
+        if url in seen: return
+        seen.add(url)
+        low=url.lower()
+        ext='m3u8' if '.m3u8' in low else 'mp4'
+        results.append({'quality':quality or (f'{height}p' if height else '视频源'),'url':url,'ext':ext,'width':width,'height':height})
+    def walk(obj,path=''):
+        if isinstance(obj,dict):
+            lower_path=path.lower()
+            if any(t in lower_path for t in ('advert','advertise','ads','recommend','sponsor','banner','commercial')):
+                return
+            width=obj.get('width') if isinstance(obj.get('width'),int) else None
+            height=obj.get('height') if isinstance(obj.get('height'),int) else None
+            video_context=any(t in lower_path for t in ('video','stream','media','master','h264','h265','hevc'))
+            for key,value in obj.items():
+                key_l=str(key).lower()
+                child_path=f'{path}.{key_l}' if path else key_l
+                if any(t in key_l for t in ('image','cover','poster','avatar','thumbnail','thumb')):
+                    continue
+                if isinstance(value,str):
+                    if video_context or any(t in key_l for t in ('masterurl','playurl','play_url','streamurl','stream_url','videourl','video_url')):
+                        add(value,width=width,height=height)
+                elif isinstance(value,list):
+                    if video_context and any(t in key_l for t in ('url','play','stream','master')):
+                        for item in value:
+                            if isinstance(item,str): add(item,width=width,height=height)
+                            else: walk(item,child_path)
+                    else:
+                        for item in value: walk(item,child_path)
+                elif isinstance(value,dict):
+                    walk(value,child_path)
+        elif isinstance(obj,list):
+            for idx,item in enumerate(obj):
+                walk(item,f'{path}[{idx}]')
+    walk(state)
+    results.sort(key=lambda x:((x.get('height') or 0),(x.get('width') or 0)),reverse=True)
+    return results
+
+
+
+def _xhs_note_id_from_url(url: str):
+    if not isinstance(url, str):
+        return None
+
+    patterns = (
+        r"/explore/([0-9a-fA-F]{16,32})",
+        r"/discovery/item/([0-9a-fA-F]{16,32})",
+        r"/item/([0-9a-fA-F]{16,32})",
+    )
+
+    for pattern in patterns:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
+
+    return None
+
+
+async def verify_video_resource(url: str, referer: str | None = None) -> bool:
+    """
+    Verify that a candidate URL actually returns video/HLS bytes,
+    not an image, HTML page, redirect ad, or unrelated asset.
+    """
+    if not is_public_remote_url(url):
+        return False
+
+    headers = {
+        "User-Agent": UA,
+        "Accept": "*/*",
+        "Range": "bytes=0-4095",
+    }
+
+    if referer:
+        headers["Referer"] = referer
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=15,
+            headers=headers,
+            http2=True,
+        ) as client:
+            r = await client.get(url)
+
+        if r.status_code not in (200, 206):
+            return False
+
+        content_type = (r.headers.get("content-type") or "").lower()
+        body = r.content[:4096]
+        low_body = body.lower()
+
+        # Strong rejections
+        if content_type.startswith("image/"):
+            return False
+
+        if "text/html" in content_type:
+            return False
+
+        if body.startswith((b"\xff\xd8\xff", b"\x89PNG", b"GIF87a", b"GIF89a", b"RIFF")):
+            # RIFF may be WEBP; reject here for XHS video validation.
+            return False
+
+        # Strong video/HLS positives
+        if content_type.startswith("video/"):
+            return True
+
+        if "mpegurl" in content_type or "application/vnd.apple.mpegurl" in content_type:
+            return True
+
+        if b"#EXTM3U" in body[:256]:
+            return True
+
+        # MP4 signature: "ftyp" generally appears very early in file.
+        if b"ftyp" in body[:128]:
+            return True
+
+        # Some XHS CDN nodes return generic octet-stream for MP4.
+        if "application/octet-stream" in content_type and b"ftyp" in body[:512]:
+            return True
+
+        return False
+
+    except Exception:
+        return False
+
+
+def _xhs_find_note_container(state, target_note_id=None):
+    """
+    Locate the exact note from noteDetailMap.
+    Prefer the note id extracted from the resolved share URL instead of
+    blindly taking the first object in noteDetailMap.
+    """
+    if not isinstance(state, dict):
+        return None, None
+
+    note_root = state.get("note")
+    if not isinstance(note_root, dict):
+        return None, None
+
+    detail_map = note_root.get("noteDetailMap")
+    if not isinstance(detail_map, dict) or not detail_map:
+        return None, None
+
+    if target_note_id:
+        # Exact map key
+        container = detail_map.get(target_note_id)
+        if isinstance(container, dict) and isinstance(container.get("note"), dict):
+            return str(target_note_id), container["note"]
+
+        # Exact id inside note object
+        for map_key, container in detail_map.items():
+            if not isinstance(container, dict):
+                continue
+            note = container.get("note")
+            if not isinstance(note, dict):
+                continue
+            nid = str(
+                note.get("noteId")
+                or note.get("id")
+                or map_key
+                or ""
+            )
+            if nid == str(target_note_id):
+                return str(map_key), note
+
+    # Fallback only if exactly one real note exists
+    valid = []
+    for map_key, container in detail_map.items():
+        if not isinstance(container, dict):
+            continue
+        note = container.get("note")
+        if isinstance(note, dict):
+            valid.append((str(map_key), note))
+
+    if len(valid) == 1:
+        return valid[0]
+
+    # Prefer a video note if multiple objects are present
+    for map_key, note in valid:
+        if str(note.get("type") or "").lower() == "video" and isinstance(note.get("video"), dict):
+            return map_key, note
+
+    return (valid[0] if valid else (None, None))
+
+
+
+def extract_xhs_structured_video(state, target_note_id=None):
+    """
+    Extract Xiaohongshu video streams from the note's structured video node.
+
+    Preferred path:
+      note.video.media.stream.h264[*].masterUrl
+
+    Falls back to h265/hevc only if h264 is unavailable.
+    """
+    note_id, note = _xhs_find_note_container(state, target_note_id)
+
+    if not note:
+        raise ValueError("没有找到小红书 noteDetailMap 笔记详情数据。")
+
+    note_type = str(note.get("type") or "").lower()
+
+    # Some responses may omit explicit type but still contain video data.
+    video = note.get("video")
+    if not isinstance(video, dict):
+        if note_type and note_type != "video":
+            raise ValueError("当前小红书笔记不是视频笔记。")
+        raise ValueError("小红书笔记存在，但没有找到 video 节点。")
+
+    media = video.get("media")
+    if not isinstance(media, dict):
+        raise ValueError("找到小红书 video 节点，但缺少 media 数据。")
+
+    stream = media.get("stream")
+    if not isinstance(stream, dict):
+        raise ValueError("找到小红书 video.media，但缺少 stream 数据。")
+
+    candidates = []
+
+    # Prefer H264 for widest playback/download compatibility.
+    for codec_key in ("h264", "h265", "hevc"):
+        items = stream.get(codec_key)
+        if not isinstance(items, list):
+            continue
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            url = (
+                item.get("masterUrl")
+                or item.get("master_url")
+                or item.get("url")
+                or item.get("playUrl")
+                or item.get("play_url")
+            )
+
+            if not isinstance(url, str) or not url.strip():
+                continue
+
+            url = normalize_url(url.strip())
+
+            if not is_public_remote_url(url):
+                continue
+
+            low = url.lower()
+            if any(ext in low for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
+                continue
+
+            width = item.get("width")
+            height = item.get("height")
+
+            quality = (
+                f"{height}p"
+                if isinstance(height, int) and height > 0
+                else str(item.get("qualityType") or item.get("quality_type") or codec_key.upper())
+            )
+
+            candidates.append({
+                "quality": quality,
+                "url": url,
+                "ext": "m3u8" if ".m3u8" in low else "mp4",
+                "width": width if isinstance(width, int) else None,
+                "height": height if isinstance(height, int) else None,
+                "codec": codec_key,
+            })
+
+        if candidates and codec_key == "h264":
+            break
+
+    if not candidates:
+        raise ValueError("这是视频笔记，但没有找到可访问的视频流 masterUrl。")
+
+    # Dedupe by URL
+    deduped = []
+    seen = set()
+    for item in candidates:
+        if item["url"] in seen:
+            continue
+        seen.add(item["url"])
+        deduped.append(item)
+
+    deduped.sort(
+        key=lambda x: ((x.get("height") or 0), (x.get("width") or 0)),
+        reverse=True,
+    )
+
+    title = (
+        note.get("title")
+        or note.get("displayTitle")
+        or note.get("desc")
+        or "小红书视频"
+    )
+
+    user = note.get("user") if isinstance(note.get("user"), dict) else {}
+    author = (
+        user.get("nickname")
+        or user.get("nickName")
+        or user.get("name")
+    )
+
+    cover = None
+    image_list = note.get("imageList")
+    if isinstance(image_list, list) and image_list:
+        first_img = image_list[0]
+        if isinstance(first_img, dict):
+            cover = (
+                first_img.get("urlDefault")
+                or first_img.get("urlPre")
+                or first_img.get("url")
+            )
+
+    # Some video nodes provide cover separately.
+    if not cover:
+        cover_obj = video.get("cover")
+        if isinstance(cover_obj, dict):
+            cover = (
+                cover_obj.get("urlDefault")
+                or cover_obj.get("url")
+                or cover_obj.get("urlPre")
+            )
+        elif isinstance(cover_obj, str):
+            cover = cover_obj
+
+    duration = (
+        video.get("duration")
+        or media.get("duration")
+    )
+
+    return {
+        "note_id": note_id,
+        "title": title,
+        "author": author,
+        "cover": normalize_url(cover or "") or None,
+        "duration": duration,
+        "videos": deduped[:12],
+    }
+
+
 async def parse_xiaohongshu(source_url: str):
-    direct = await resolve_public_share(source_url)
-    final_url, page = await fetch_html(direct)
+    direct_url = await resolve_public_share(source_url)
+    final_url, page = await fetch_html(direct_url)
 
     if "/login" in final_url or "captcha" in final_url.lower():
         raise ValueError("小红书公开页面当前要求登录或验证码，未尝试绕过访问限制。")
@@ -318,31 +682,48 @@ async def parse_xiaohongshu(source_url: str):
         extract_balanced_json(page, "window.__INITIAL_STATE__")
         or extract_balanced_json(page, "__INITIAL_STATE__")
     )
+
     if not state:
         raise ValueError("小红书页面已打开，但没有找到公开的 __INITIAL_STATE__ 数据。")
 
-    videos = collect_media_urls(state, "xiaohongshu")
-    if not videos:
-        raise ValueError("已读取小红书公开页面，但没有找到可直接访问的视频资源。")
+    target_note_id = (
+        _xhs_note_id_from_url(final_url)
+        or _xhs_note_id_from_url(direct_url)
+        or _xhs_note_id_from_url(source_url)
+    )
 
-    title = first_string_for_keys(state, ("title", "displayTitle", "desc", "description"))
-    author = first_string_for_keys(state, ("nickname", "nickName", "name"))
-    cover = first_string_for_keys(state, ("cover", "coverUrl", "image", "imageUrl"))
-    duration = first_number_for_keys(state, ("duration", "videoDuration"))
+    structured = extract_xhs_structured_video(
+        state,
+        target_note_id=target_note_id,
+    )
+
+    verified = []
+    for item in structured.get("videos") or []:
+        url = item.get("url")
+        if not url:
+            continue
+
+        if await verify_video_resource(url, referer=final_url):
+            verified.append(item)
+
+    if not verified:
+        raise ValueError(
+            "已找到小红书视频节点，但所有候选 masterUrl 经实际请求验证后都不是有效视频流。"
+            "这通常说明分享链接已过期、页面返回了替代资源，或 CDN 地址被平台改写。"
+        )
 
     return {
         "platform": "XiaoHongShu",
-        "id": first_string_for_keys(state, ("noteId", "id")),
-        "title": title or "小红书视频",
-        "author": author,
-        "cover": normalize_url(cover or "") or None,
-        "duration": duration,
+        "id": structured.get("note_id"),
+        "title": structured.get("title") or "小红书视频",
+        "author": structured.get("author"),
+        "cover": structured.get("cover"),
+        "duration": structured.get("duration"),
         "source_url": source_url,
         "resolved_url": final_url,
         "referer": final_url,
-        "videos": videos[:12],
+        "videos": verified[:12],
     }
-
 
 
 def extract_douyin_aweme_id(url: str) -> str | None:
@@ -1061,7 +1442,7 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "version": "2.4"}
+    return {"ok": True, "version": "2.8"}
 
 
 @app.post("/api/parse")
