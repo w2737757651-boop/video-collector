@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 yt-dlp
 httpx[http2]
+playwright==1.55.0
