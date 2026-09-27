@@ -106,11 +106,11 @@ pasteBtn.onclick=async()=>{
 };
 
 
-function appDownload(url, filename){
-  const absolute=new URL(url,location.href).href;
-  if(window.AndroidDownloader&&typeof window.AndroidDownloader.download==='function'){
-    window.AndroidDownloader.download(absolute,filename||'download');
+function appDownload(directUrl, proxyUrl, filename, referer){
+  if(window.AndroidDownloader && typeof window.AndroidDownloader.download === 'function'){
+    window.AndroidDownloader.download(directUrl, filename || 'download', referer || '');
   }else{
+    const absolute=new URL(proxyUrl || directUrl,location.href).href;
     location.href=absolute;
   }
 }
@@ -120,8 +120,34 @@ go.onclick=async()=>{
  if(!text){showStatus('请先粘贴分享链接或分享文案。','err');return;}
  go.disabled=true;result.className='card hidden';showStatus('正在解析视频和音频，请等待……');
  try{
-  const r=await fetch('/api/parse',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
-  const j=await r.json();
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),35000);
+  let r;
+  try{
+    r=await fetch('/api/parse',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text}),
+      signal:controller.signal
+    });
+  }finally{
+    clearTimeout(timer);
+  }
+
+  const raw=await r.text();
+  let j=null;
+  try{ j=raw ? JSON.parse(raw) : null; }catch(e){}
+
+  if(!r.ok){
+    showStatus('服务器解析失败（HTTP '+r.status+'）。'+(raw?'\n'+raw.slice(0,500):'\n服务器没有返回有效内容。'),'err');
+    return;
+  }
+
+  if(!j){
+    showStatus('服务器没有返回有效 JSON。该次解析可能超时或服务进程被重启，请稍后重试。','err');
+    return;
+  }
+
   if(!j.success){showStatus(j.error||'解析失败','err');return;}
   hideStatus();
   const d=j.data||{},vids=d.videos||[],audios=d.audios||[];
@@ -133,7 +159,7 @@ go.onclick=async()=>{
     <div><div>${esc(f.quality||'视频源')}</div><div class="muted">${esc(f.ext||'')}${f.width&&f.height?' · '+f.width+'×'+f.height:''}</div></div>
     <div class="actions">
      <a class="btn open" href="${esc(f.url)}" target="_blank" rel="noopener">打开</a>
-     ${f.download_url?`<button class="btn download" onclick="appDownload('${esc(f.download_url)}','${esc((d.title||'video')+'.'+(f.ext||'mp4'))}')">下载</button>`:''}
+     ${f.download_url?`<button class="btn download" onclick="appDownload('${esc(f.url)}','${esc(f.download_url||'')}','${esc((d.title||'video')+'.'+(f.ext||'mp4'))}','${esc(d.referer||d.resolved_url||'')}')">下载</button>`:''}
     </div>
    </div>`).join('');
 
@@ -143,7 +169,7 @@ go.onclick=async()=>{
      <div><div>${esc(a.quality||'音频')}</div><div class="muted">${esc(a.ext||'')}${a.abr?' · '+Math.round(a.abr)+' kbps':''}</div></div>
      <div class="actions">
       <a class="btn open" href="${esc(a.url)}" target="_blank" rel="noopener">打开</a>
-      ${a.download_url?`<button class="btn download" onclick="appDownload('${esc(a.download_url)}','${esc((a.title||d.title||'audio')+'.'+(a.ext||'m4a'))}')">下载音频</button>`:''}
+      ${a.download_url?`<button class="btn download" onclick="appDownload('${esc(a.url)}','${esc(a.download_url||'')}','${esc((a.title||d.title||'audio')+'.'+(a.ext||'m4a'))}','${esc(d.referer||d.resolved_url||'')}')">下载音频</button>`:''}
      </div>
     </div>
     <audio controls preload="metadata" src="${esc(a.url)}"></audio>
@@ -155,7 +181,13 @@ go.onclick=async()=>{
   ${audios.length?`<div class="sectionTitle">音频</div>${audioRows}`:''}
   ${!vids.length&&!audios.length?'<div class="muted" style="margin-top:14px">没有发现可直接访问的视频或音频资源。</div>':''}`;
   result.className='card';
- }catch(e){showStatus('网络请求失败：'+e.message,'err');}
+ }catch(e){
+   if(e && e.name==='AbortError'){
+     showStatus('解析超过 35 秒已自动停止。当前平台响应过慢，请换一条新分享链接或稍后再试。','err');
+   }else{
+     showStatus('网络请求失败：'+e.message,'err');
+   }
+ }
  finally{go.disabled=false;}
 };
 </script>

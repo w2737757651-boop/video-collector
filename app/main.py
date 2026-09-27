@@ -17,7 +17,7 @@ from playwright.async_api import async_playwright
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 
-app = FastAPI(title="Video Collector", version="3.3")
+app = FastAPI(title="Video Collector", version="3.4")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 URL_RE = re.compile(r'https?://[^\s<>"\']+', re.I)
@@ -900,6 +900,25 @@ async def parse_xhs_with_browser(source_url: str):
 
         page = await context.new_page()
 
+        async def block_heavy_assets(route):
+            try:
+                rtype = route.request.resource_type
+                low = route.request.url.lower()
+                if rtype in ("image", "font", "stylesheet"):
+                    await route.abort()
+                    return
+                if any(t in low for t in ("adserver", "/ads/", "analytics", "sensorsdata", "collect?")):
+                    await route.abort()
+                    return
+                await route.continue_()
+            except Exception:
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        await page.route("**/*", block_heavy_assets)
+
         page.on(
             "request",
             lambda req: maybe_add(req.url)
@@ -909,19 +928,11 @@ async def parse_xhs_with_browser(source_url: str):
             await page.goto(
                 source_url,
                 wait_until="domcontentloaded",
-                timeout=45000,
+                timeout=25000,
             )
 
             # Let client-side hydration/network requests complete.
-            try:
-                await page.wait_for_load_state(
-                    "networkidle",
-                    timeout=12000,
-                )
-            except Exception:
-                pass
-
-            await page.wait_for_timeout(2500)
+            await page.wait_for_timeout(3000)
 
             final_url = page.url
 
@@ -1985,7 +1996,7 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "version": "3.3"}
+    return {"ok": True, "version": "3.4"}
 
 
 @app.post("/api/parse")
