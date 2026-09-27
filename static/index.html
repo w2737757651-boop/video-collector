@@ -121,7 +121,7 @@ go.onclick=async()=>{
  go.disabled=true;result.className='card hidden';showStatus('正在解析视频和音频，请等待……');
  try{
   const controller=new AbortController();
-  const timer=setTimeout(()=>controller.abort(),30000);
+  const timer=setTimeout(()=>controller.abort(),22000);
   let r;
   try{
     r=await fetch('/api/parse',{
@@ -183,9 +183,9 @@ go.onclick=async()=>{
   result.className='card';
  }catch(e){
    if(e && e.name==='AbortError'){
-     showStatus('解析超过 30 秒已自动停止。当前平台响应过慢，请换一条新分享链接或稍后再试。','err');
+     showStatus('解析超过 22 秒已停止。服务器没有在限定时间内完成，请稍后再试。','err');
    }else{
-     showStatus('网络请求失败：'+e.message,'err');
+     showStatus('网络连接中断：'+e.message,'err');
    }
  }
  finally{go.disabled=false;}

@@ -4,6 +4,7 @@ import json
 import re
 import socket
 import time
+import copy
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse, parse_qs
 
@@ -18,26 +19,69 @@ from playwright.async_api import async_playwright
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 
-app = FastAPI(title="Video Collector", version="4.0")
+app = FastAPI(title="Video Collector", version="4.1")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 _PARSE_CACHE = {}
-_PARSE_CACHE_TTL = 600
+_PARSE_CACHE_TTL = 600  # 10 minutes
 
 def _cache_get(key):
     item = _PARSE_CACHE.get(key)
     if not item:
         return None
+
     expires_at, value = item
     if time.time() >= expires_at:
         _PARSE_CACHE.pop(key, None)
         return None
-    return value
+
+    return copy.deepcopy(value)
 
 def _cache_set(key, value):
-    _PARSE_CACHE[key] = (time.time() + _PARSE_CACHE_TTL, value)
+    _PARSE_CACHE[key] = (
+        time.time() + _PARSE_CACHE_TTL,
+        copy.deepcopy(value),
+    )
+
     if len(_PARSE_CACHE) > 128:
+        # Drop the oldest inserted entry.
         _PARSE_CACHE.pop(next(iter(_PARSE_CACHE)), None)
+
+
+# Lazily created, reused Chromium instance for Xiaohongshu fallback.
+_XHS_PLAYWRIGHT = None
+_XHS_BROWSER = None
+_XHS_BROWSER_LOCK = asyncio.Lock()
+
+
+async def _get_xhs_browser():
+    global _XHS_PLAYWRIGHT, _XHS_BROWSER
+
+    if _XHS_BROWSER is not None:
+        try:
+            if _XHS_BROWSER.is_connected():
+                return _XHS_BROWSER
+        except Exception:
+            pass
+
+    async with _XHS_BROWSER_LOCK:
+        if _XHS_BROWSER is not None:
+            try:
+                if _XHS_BROWSER.is_connected():
+                    return _XHS_BROWSER
+            except Exception:
+                pass
+
+        _XHS_PLAYWRIGHT = await async_playwright().start()
+        _XHS_BROWSER = await _XHS_PLAYWRIGHT.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        return _XHS_BROWSER
 
 
 URL_RE = re.compile(r'https?://[^\s<>"\']+', re.I)
@@ -902,23 +946,15 @@ async def parse_xhs_with_browser(source_url: str):
         seen.add(url)
         captured.append(url)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
+    browser = await _get_xhs_browser()
 
-        context = await browser.new_context(
-            user_agent=UA,
-            locale="zh-CN",
-            viewport={"width": 1280, "height": 900},
-        )
+    context = await browser.new_context(
+        user_agent=UA,
+        locale="zh-CN",
+        viewport={"width": 1280, "height": 900},
+    )
 
-        page = await context.new_page()
+    page = await context.new_page()
 
         async def block_heavy_assets(route):
             try:
@@ -948,11 +984,11 @@ async def parse_xhs_with_browser(source_url: str):
             await page.goto(
                 source_url,
                 wait_until="domcontentloaded",
-                timeout=25000,
+                timeout=9000,
             )
 
             # Let client-side hydration/network requests complete.
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(1200)
 
             final_url = page.url
 
@@ -1094,48 +1130,42 @@ async def parse_xhs_with_browser(source_url: str):
 
         finally:
             await context.close()
-            await browser.close()
 
 
 async def parse_xiaohongshu(source_url: str):
     """
-    Public-page parser:
-      1) Try lightweight HTTP SSR.
-      2) If SSR is simplified/missing note detail, fall back to a real browser.
+    Fast staged Xiaohongshu parser.
+
+    Stage 1: lightweight HTTP SSR, hard-capped.
+    Stage 2: reused Chromium fallback, hard-capped.
+    No stage is allowed to block the API for 30+ seconds.
     """
     http_error = None
 
     try:
-        direct_url = await resolve_xhs_share_context(source_url)
-
-        final_url, page = await fetch_html(
-            direct_url,
-            referer="https://www.xiaohongshu.com/",
+        direct_url = await asyncio.wait_for(
+            resolve_xhs_share_context(source_url),
+            timeout=4.5,
         )
 
-        if (
-            "/login" in final_url
-            or "captcha" in final_url.lower()
-        ):
-            raise ValueError(
-                "小红书 HTTP 页面被跳转到登录/验证码页面。"
-            )
+        final_url, page = await asyncio.wait_for(
+            fetch_html(
+                direct_url,
+                referer="https://www.xiaohongshu.com/",
+            ),
+            timeout=5.5,
+        )
+
+        if "/login" in final_url or "captcha" in final_url.lower():
+            raise ValueError("小红书 HTTP 页面被跳转到登录/验证码页面。")
 
         state = (
-            extract_balanced_json(
-                page,
-                "window.__INITIAL_STATE__"
-            )
-            or extract_balanced_json(
-                page,
-                "__INITIAL_STATE__"
-            )
+            extract_balanced_json(page, "window.__INITIAL_STATE__")
+            or extract_balanced_json(page, "__INITIAL_STATE__")
         )
 
         if not state:
-            raise ValueError(
-                "HTTP 页面没有完整 __INITIAL_STATE__。"
-            )
+            raise ValueError("HTTP 页面没有完整 __INITIAL_STATE__。")
 
         target_note_id = (
             _xhs_note_id_from_url(final_url)
@@ -1152,20 +1182,25 @@ async def parse_xiaohongshu(source_url: str):
 
         for item in structured.get("videos") or []:
             url = item.get("url")
+            if not url:
+                continue
 
-            if (
-                url
-                and await verify_video_resource(
-                    url,
-                    referer=final_url,
+            try:
+                ok = await asyncio.wait_for(
+                    verify_video_resource(
+                        url,
+                        referer=final_url,
+                    ),
+                    timeout=2.5,
                 )
-            ):
+            except asyncio.TimeoutError:
+                ok = False
+
+            if ok:
                 verified.append(item)
 
         if not verified:
-            raise ValueError(
-                "HTTP SSR 找到视频结构，但视频流校验失败。"
-            )
+            raise ValueError("HTTP SSR 找到视频结构，但视频流校验失败。")
 
         return {
             "platform": "XiaoHongShu",
@@ -1184,13 +1219,21 @@ async def parse_xiaohongshu(source_url: str):
     except Exception as exc:
         http_error = str(exc)
 
-    # Real browser fallback for simplified SSR / JS-hydrated pages.
     try:
-        return await parse_xhs_with_browser(source_url)
+        return await asyncio.wait_for(
+            parse_xhs_with_browser(source_url),
+            timeout=11.0,
+        )
+
+    except asyncio.TimeoutError:
+        raise ValueError(
+            "小红书浏览器解析超过 11 秒，已停止。"
+            "当前公开网页响应过慢或未暴露视频资源。"
+        )
 
     except Exception as browser_error:
         raise ValueError(
-            "小红书 HTTP 解析失败："
+            "小红书快速解析失败："
             + str(http_error)
             + "；浏览器解析失败："
             + str(browser_error)
@@ -2016,14 +2059,24 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "version": "4.0"}
+    return {"ok": True, "version": "4.1"}
 
 
 @app.post("/api/parse")
 async def parse_video(body: ParseBody):
     try:
         source_url = extract_url(body.text)
-        data = await parse_any(source_url)
+        validate_source_url(source_url)
+
+        data = _cache_get(source_url)
+
+        if data is None:
+            # Overall server-side cap. Xiaohongshu has its own shorter stages.
+            data = await asyncio.wait_for(
+                parse_any(source_url),
+                timeout=18.0,
+            )
+            _cache_set(source_url, data)
 
         for i, item in enumerate(data.get("videos") or []):
             item["download_url"] = (
@@ -2046,10 +2099,14 @@ async def parse_video(body: ParseBody):
     except asyncio.TimeoutError:
         return {
             "success": False,
-            "error": "解析超时。该平台当前可能要求额外验证。",
+            "error": "解析超过 18 秒，服务器已主动停止本次任务。",
         }
+
     except Exception as e:
-        return {"success": False, "error": str(e)[:1800]}
+        return {
+            "success": False,
+            "error": str(e)[:1800],
+        }
 
 
 @app.get("/api/download")
