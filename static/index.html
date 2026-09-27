@@ -8,7 +8,7 @@
 <style>
 *{box-sizing:border-box}
 body{margin:0;background:#101317;color:#f4f7fa;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
-.wrap{max-width:760px;margin:auto;padding:24px 16px 60px}
+.wrap{max-width:760px;margin:auto;padding:24px 16px 80px}
 h1{font-size:30px;margin:0 0 8px}.sub{color:#96a0aa;line-height:1.7;margin-bottom:18px}
 .card{background:#181d23;border:1px solid #2a323b;border-radius:18px;padding:16px;margin-bottom:14px}
 textarea{width:100%;height:150px;border:1px solid #36414c;border-radius:14px;background:#0f1317;color:#fff;padding:14px;font-size:16px;resize:vertical}
@@ -18,67 +18,91 @@ button,.btn{border:0;border-radius:12px;min-height:46px;padding:0 15px;font-size
 .muted{color:#89949f;font-size:13px;line-height:1.6}.hidden{display:none}
 .err{color:#ff9191;white-space:pre-wrap;line-height:1.7}
 .video{display:block;width:100%;max-height:560px;background:#000;border-radius:14px}
-.cover{display:block;width:160px;max-height:160px;object-fit:cover;border-radius:12px;margin-top:12px}
 .title{font-size:19px;font-weight:700;line-height:1.45;margin:12px 0 5px}
 .meta{color:#a5afb9;font-size:14px;line-height:1.65}
+.sectionTitle{font-size:17px;font-weight:700;margin:18px 0 5px}
 .row{border-top:1px solid #2b333c;padding:12px 0;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.audioRow{border-top:1px solid #2b333c;padding:12px 0}
 .actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .badge{display:inline-block;padding:5px 9px;background:#242c34;border-radius:20px;margin:4px 4px 0 0;color:#aeb8c2;font-size:12px}
+audio{width:100%;margin-top:10px}
 </style>
 </head>
 <body>
 <main class="wrap">
-  <h1>Video Collector</h1>
-  <div class="sub">粘贴公开分享链接或完整分享文案，解析后可直接预览和下载视频。</div>
-  <section class="card">
-    <textarea id="txt" placeholder="粘贴抖音 / 小红书 / 快手 / B站 / 视频号分享链接或分享文案"></textarea>
-    <button id="go" class="primary">开始解析</button>
-    <div style="margin-top:12px">
-      <span class="badge">抖音</span><span class="badge">小红书</span><span class="badge">快手</span><span class="badge">B站</span><span class="badge">视频号</span>
-    </div>
-    <div class="muted" style="margin-top:10px">仅处理公开可访问且你有权保存的内容；不会绕过登录、验证码、DRM 或访问控制。</div>
-  </section>
-  <section id="status" class="card hidden"></section>
-  <section id="result" class="card hidden"></section>
+<h1>Video Collector</h1>
+<div class="sub">粘贴分享链接，解析视频与音频，可直接预览、播放和下载。</div>
+
+<section class="card">
+<textarea id="txt" placeholder="粘贴抖音 / 小红书 / 快手 / B站 / 视频号分享链接或完整分享文案"></textarea>
+<button id="go" class="primary">开始解析</button>
+<div style="margin-top:12px">
+<span class="badge">抖音</span><span class="badge">小红书</span><span class="badge">快手</span><span class="badge">B站</span><span class="badge">视频号</span><span class="badge">音频</span>
+</div>
+<div class="muted" style="margin-top:10px">仅处理公开可访问且你有权保存的内容；不会绕过登录、验证码、DRM 或访问控制。</div>
+</section>
+
+<section id="status" class="card hidden"></section>
+<section id="result" class="card hidden"></section>
 </main>
+
 <script>
 const txt=document.getElementById('txt'),go=document.getElementById('go'),status=document.getElementById('status'),result=document.getElementById('result');
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));}
 function showStatus(msg,cls=''){status.className='card '+cls;status.textContent=msg;}
 function hideStatus(){status.className='card hidden';}
 
+function appDownload(url, filename){
+  const absolute=new URL(url,location.href).href;
+  if(window.AndroidDownloader&&typeof window.AndroidDownloader.download==='function'){
+    window.AndroidDownloader.download(absolute,filename||'download');
+  }else{
+    location.href=absolute;
+  }
+}
+
 go.onclick=async()=>{
-  const text=txt.value.trim();
-  if(!text){showStatus('请先粘贴分享链接或分享文案。','err');return;}
-  go.disabled=true; result.className='card hidden'; showStatus('正在解析并验证真实视频流，请等待……');
-  try{
-    const r=await fetch('/api/parse',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
-    const j=await r.json();
-    if(!j.success){showStatus(j.error||'解析失败','err');return;}
-    hideStatus();
-    const d=j.data||{};
-    const vids=d.videos||[];
-    const first=vids[0];
-    const preview=first && first.url
-      ? `<video class="video" controls playsinline preload="metadata" ${d.cover?`poster="${esc(d.cover)}"`:''}><source src="${esc(first.url)}" type="${first.ext==='m3u8'?'application/vnd.apple.mpegurl':'video/mp4'}">当前浏览器无法直接播放该视频。</video>`
-      : '';
-    const rows=vids.slice(0,8).map(f=>`
-      <div class="row">
-        <div><div>${esc(f.quality||'视频源')}</div><div class="muted">${esc(f.ext||'')}${f.width&&f.height?' · '+f.width+'×'+f.height:''}</div></div>
-        <div class="actions">
-          <a class="btn open" href="${esc(f.url)}" target="_blank" rel="noopener">打开</a>
-          ${f.download_url?`<a class="btn download" href="${esc(f.download_url)}">下载</a>`:''}
-        </div>
-      </div>`).join('');
-    result.innerHTML=`
-      ${preview}
-      <div class="title">${esc(d.title||'未命名视频')}</div>
-      <div class="meta">${d.author?'作者：'+esc(d.author)+'<br>':''}${d.platform?'平台：'+esc(d.platform)+'<br>':''}${d.duration?'时长：'+Math.round(d.duration)+' 秒':''}</div>
-      ${!preview && d.cover?`<img class="cover" src="${esc(d.cover)}" alt="封面">`:''}
-      <div style="margin-top:12px">${rows||'<div class="muted">没有发现有效视频资源。</div>'}</div>`;
-    result.className='card';
-  }catch(e){showStatus('网络请求失败：'+e.message,'err');}
-  finally{go.disabled=false;}
+ const text=txt.value.trim();
+ if(!text){showStatus('请先粘贴分享链接或分享文案。','err');return;}
+ go.disabled=true;result.className='card hidden';showStatus('正在解析视频和音频，请等待……');
+ try{
+  const r=await fetch('/api/parse',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+  const j=await r.json();
+  if(!j.success){showStatus(j.error||'解析失败','err');return;}
+  hideStatus();
+  const d=j.data||{},vids=d.videos||[],audios=d.audios||[];
+  const first=vids[0];
+  const preview=first&&first.url?`<video class="video" controls playsinline preload="metadata" ${d.cover?`poster="${esc(d.cover)}"`:''}><source src="${esc(first.url)}"></video>`:'';
+
+  const videoRows=vids.map(f=>`
+   <div class="row">
+    <div><div>${esc(f.quality||'视频源')}</div><div class="muted">${esc(f.ext||'')}${f.width&&f.height?' · '+f.width+'×'+f.height:''}</div></div>
+    <div class="actions">
+     <a class="btn open" href="${esc(f.url)}" target="_blank" rel="noopener">打开</a>
+     ${f.download_url?`<button class="btn download" onclick="appDownload('${esc(f.download_url)}','${esc((d.title||'video')+'.'+(f.ext||'mp4'))}')">下载</button>`:''}
+    </div>
+   </div>`).join('');
+
+  const audioRows=audios.map(a=>`
+   <div class="audioRow">
+    <div class="row" style="border-top:0;padding-top:0">
+     <div><div>${esc(a.quality||'音频')}</div><div class="muted">${esc(a.ext||'')}${a.abr?' · '+Math.round(a.abr)+' kbps':''}</div></div>
+     <div class="actions">
+      <a class="btn open" href="${esc(a.url)}" target="_blank" rel="noopener">打开</a>
+      ${a.download_url?`<button class="btn download" onclick="appDownload('${esc(a.download_url)}','${esc((a.title||d.title||'audio')+'.'+(a.ext||'m4a'))}')">下载音频</button>`:''}
+     </div>
+    </div>
+    <audio controls preload="metadata" src="${esc(a.url)}"></audio>
+   </div>`).join('');
+
+  result.innerHTML=`${preview}<div class="title">${esc(d.title||'未命名内容')}</div>
+  <div class="meta">${d.author?'作者：'+esc(d.author)+'<br>':''}${d.platform?'平台：'+esc(d.platform)+'<br>':''}${d.duration?'时长：'+Math.round(d.duration)+' 秒':''}</div>
+  ${vids.length?`<div class="sectionTitle">视频</div>${videoRows}`:''}
+  ${audios.length?`<div class="sectionTitle">音频</div>${audioRows}`:''}
+  ${!vids.length&&!audios.length?'<div class="muted" style="margin-top:14px">没有发现可直接访问的视频或音频资源。</div>':''}`;
+  result.className='card';
+ }catch(e){showStatus('网络请求失败：'+e.message,'err');}
+ finally{go.disabled=false;}
 };
 </script>
 </body>

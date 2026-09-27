@@ -17,7 +17,7 @@ from playwright.async_api import async_playwright
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 
-app = FastAPI(title="Video Collector", version="3.1")
+app = FastAPI(title="Video Collector", version="3.2")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 URL_RE = re.compile(r'https?://[^\s<>"\']+', re.I)
@@ -1209,6 +1209,70 @@ def find_douyin_item(state):
     return None
 
 
+
+def extract_douyin_audio(item: dict):
+    if not isinstance(item, dict):
+        return []
+
+    music = item.get("music")
+    if not isinstance(music, dict):
+        return []
+
+    play = music.get("play_url") or music.get("playUrl")
+    urls = []
+
+    if isinstance(play, dict):
+        urls = play.get("url_list") or play.get("urlList") or play.get("urls") or []
+    elif isinstance(play, list):
+        urls = play
+
+    title = (
+        music.get("title")
+        or music.get("music_name")
+        or music.get("musicName")
+        or "抖音音频"
+    )
+    author = (
+        music.get("author")
+        or music.get("owner_nickname")
+        or music.get("ownerNickname")
+    )
+
+    result = []
+    seen = set()
+
+    for url in urls:
+        if not isinstance(url, str):
+            continue
+        url = normalize_url(url)
+        if not url.startswith(("http://", "https://")):
+            continue
+        if url in seen or not is_public_remote_url(url):
+            continue
+        seen.add(url)
+
+        low = url.lower()
+        if ".m4a" in low:
+            ext = "m4a"
+        elif ".aac" in low:
+            ext = "aac"
+        elif ".mp3" in low:
+            ext = "mp3"
+        else:
+            ext = "mp3"
+
+        result.append({
+            "quality": "原声音频",
+            "url": url,
+            "ext": ext,
+            "abr": None,
+            "title": title,
+            "author": author,
+        })
+
+    return result
+
+
 def douyin_item_to_result(item: dict, source_url: str, resolved_url: str):
     video = item.get("video") or {}
 
@@ -1299,6 +1363,7 @@ def douyin_item_to_result(item: dict, source_url: str, resolved_url: str):
         "resolved_url": resolved_url,
         "referer": resolved_url,
         "videos": urls[:12],
+        "audios": extract_douyin_audio(item)[:8],
     }
 
 
@@ -1792,12 +1857,45 @@ async def parse_with_ytdlp(url: str):
         raise ValueError("解析器没有返回视频数据")
 
     formats = []
+    audios = []
+
     for f in info.get("formats") or []:
         media_url = f.get("url")
-        if not media_url or f.get("vcodec") == "none":
+        if not media_url:
             continue
+
         if not is_public_remote_url(media_url):
             continue
+
+        vcodec = f.get("vcodec")
+        acodec = f.get("acodec")
+
+        # Audio-only format
+        if vcodec == "none" and acodec not in (None, "none"):
+            audios.append({
+                "quality": (
+                    f"{round(f.get('abr'))} kbps"
+                    if isinstance(f.get("abr"), (int, float))
+                    else f.get("format_note")
+                    or f.get("format_id")
+                    or "音频"
+                ),
+                "url": media_url,
+                "ext": f.get("ext") or "m4a",
+                "abr": f.get("abr"),
+                "title": info.get("title"),
+                "author": (
+                    info.get("uploader")
+                    or info.get("channel")
+                    or info.get("creator")
+                ),
+            })
+            continue
+
+        # Video format
+        if vcodec == "none":
+            continue
+
         formats.append({
             "quality": (
                 f"{f.get('height')}p"
@@ -1814,6 +1912,10 @@ async def parse_with_ytdlp(url: str):
         key=lambda x: ((x.get("height") or 0), (x.get("width") or 0)),
         reverse=True,
     )
+    audios.sort(
+        key=lambda x: x.get("abr") or 0,
+        reverse=True,
+    )
 
     return {
         "platform": info.get("extractor_key") or info.get("extractor"),
@@ -1826,6 +1928,7 @@ async def parse_with_ytdlp(url: str):
         "resolved_url": url,
         "referer": url,
         "videos": formats[:12],
+        "audios": audios[:8],
     }
 
 
@@ -1882,7 +1985,7 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "version": "3.1"}
+    return {"ok": True, "version": "3.2"}
 
 
 @app.post("/api/parse")
@@ -1895,7 +1998,15 @@ async def parse_video(body: ParseBody):
             item["download_url"] = (
                 "/api/download?source="
                 + quote(source_url, safe="")
-                + "&index="
+                + "&kind=video&index="
+                + str(i)
+            )
+
+        for i, item in enumerate(data.get("audios") or []):
+            item["download_url"] = (
+                "/api/download?source="
+                + quote(source_url, safe="")
+                + "&kind=audio&index="
                 + str(i)
             )
 
@@ -1913,17 +2024,30 @@ async def parse_video(body: ParseBody):
 @app.get("/api/download")
 async def download_video(
     source: str = Query(...),
+    kind: str = Query("video"),
     index: int = Query(0, ge=0, le=30),
 ):
     try:
         validate_source_url(source)
         data = await parse_any(source)
-        videos = data.get("videos") or []
 
-        if index >= len(videos):
-            raise HTTPException(status_code=404, detail="视频清晰度不存在")
+        if kind not in ("video", "audio"):
+            raise HTTPException(status_code=400, detail="kind 只支持 video 或 audio")
 
-        media_url = videos[index]["url"]
+        media_items = (
+            data.get("audios")
+            if kind == "audio"
+            else data.get("videos")
+        ) or []
+
+        if index >= len(media_items):
+            raise HTTPException(
+                status_code=404,
+                detail="音频不存在" if kind == "audio" else "视频清晰度不存在",
+            )
+
+        media_url = media_items[index]["url"]
+
         if not is_public_remote_url(media_url):
             raise HTTPException(status_code=400, detail="媒体地址无效")
 
@@ -1946,12 +2070,13 @@ async def download_video(
             await client.aclose()
             raise HTTPException(
                 status_code=502,
-                detail=f"视频源返回 HTTP {response.status_code}",
+                detail=f"媒体源返回 HTTP {response.status_code}",
             )
 
-        title = re.sub(r'[\\/:*?"<>|]+', "_", data.get("title") or "video")[:80]
-        ext = videos[index].get("ext") or "mp4"
-        filename = f"{title}.{ext}"
+        title = re.sub(r'[\\/:*?"<>|]+', "_", data.get("title") or "media")[:80]
+        ext = media_items[index].get("ext") or ("m4a" if kind == "audio" else "mp4")
+        suffix = "_音频" if kind == "audio" else ""
+        filename = f"{title}{suffix}.{ext}"
 
         async def body_iter():
             try:
@@ -1961,7 +2086,10 @@ async def download_video(
                 await response.aclose()
                 await client.aclose()
 
-        content_type = response.headers.get("content-type", "application/octet-stream")
+        content_type = response.headers.get(
+            "content-type",
+            "application/octet-stream"
+        )
         headers_out = {
             "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"
         }
@@ -1976,3 +2104,4 @@ async def download_video(
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)[:1000])
+
