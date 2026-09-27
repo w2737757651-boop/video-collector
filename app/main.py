@@ -3,6 +3,7 @@ import html
 import json
 import re
 import socket
+import time
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse, parse_qs
 
@@ -17,8 +18,27 @@ from playwright.async_api import async_playwright
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 
-app = FastAPI(title="Video Collector", version="3.4")
+app = FastAPI(title="Video Collector", version="4.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+_PARSE_CACHE = {}
+_PARSE_CACHE_TTL = 600
+
+def _cache_get(key):
+    item = _PARSE_CACHE.get(key)
+    if not item:
+        return None
+    expires_at, value = item
+    if time.time() >= expires_at:
+        _PARSE_CACHE.pop(key, None)
+        return None
+    return value
+
+def _cache_set(key, value):
+    _PARSE_CACHE[key] = (time.time() + _PARSE_CACHE_TTL, value)
+    if len(_PARSE_CACHE) > 128:
+        _PARSE_CACHE.pop(next(iter(_PARSE_CACHE)), None)
+
 
 URL_RE = re.compile(r'https?://[^\s<>"\']+', re.I)
 
@@ -1996,7 +2016,7 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "version": "3.4"}
+    return {"ok": True, "version": "4.0"}
 
 
 @app.post("/api/parse")
