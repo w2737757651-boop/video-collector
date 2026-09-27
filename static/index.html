@@ -13,7 +13,7 @@ h1{font-size:30px;margin:0 0 8px}.sub{color:#96a0aa;line-height:1.7;margin-botto
 .card{background:#181d23;border:1px solid #2a323b;border-radius:18px;padding:16px;margin-bottom:14px}
 textarea{width:100%;height:150px;border:1px solid #36414c;border-radius:14px;background:#0f1317;color:#fff;padding:14px;font-size:16px;resize:vertical}
 button,.btn{border:0;border-radius:12px;min-height:46px;padding:0 15px;font-size:15px;font-weight:700;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;cursor:pointer}
-.primary{width:100%;background:#fff;color:#111;margin-top:12px}.primary:disabled{opacity:.55}
+.toolbar{display:flex;gap:10px;margin-top:12px}.toolbtn{flex:1;background:#29313a;color:#fff}.primary{width:100%;background:#fff;color:#111;margin-top:12px}.primary:disabled{opacity:.55}
 .open{background:#29313a;color:#fff}.download{background:#fff;color:#111}
 .muted{color:#89949f;font-size:13px;line-height:1.6}.hidden{display:none}
 .err{color:#ff9191;white-space:pre-wrap;line-height:1.7}
@@ -35,6 +35,10 @@ audio{width:100%;margin-top:10px}
 
 <section class="card">
 <textarea id="txt" placeholder="粘贴抖音 / 小红书 / 快手 / B站 / 视频号分享链接或完整分享文案"></textarea>
+<div class="toolbar">
+  <button id="clearBtn" class="toolbtn">清空</button>
+  <button id="pasteBtn" class="toolbtn">粘贴最新链接</button>
+</div>
 <button id="go" class="primary">开始解析</button>
 <div style="margin-top:12px">
 <span class="badge">抖音</span><span class="badge">小红书</span><span class="badge">快手</span><span class="badge">B站</span><span class="badge">视频号</span><span class="badge">音频</span>
@@ -47,10 +51,60 @@ audio{width:100%;margin-top:10px}
 </main>
 
 <script>
-const txt=document.getElementById('txt'),go=document.getElementById('go'),status=document.getElementById('status'),result=document.getElementById('result');
+const txt=document.getElementById('txt'),go=document.getElementById('go'),status=document.getElementById('status'),result=document.getElementById('result'),clearBtn=document.getElementById('clearBtn'),pasteBtn=document.getElementById('pasteBtn');
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));}
 function showStatus(msg,cls=''){status.className='card '+cls;status.textContent=msg;}
 function hideStatus(){status.className='card hidden';}
+
+
+clearBtn.onclick=()=>{
+  txt.value='';
+  status.className='card hidden';
+  status.textContent='';
+  result.className='card hidden';
+  result.innerHTML='';
+  txt.focus();
+};
+
+async function readClipboardText(){
+  // Android APP native bridge first
+  if(window.AndroidClipboard && typeof window.AndroidClipboard.getText === 'function'){
+    try{
+      return window.AndroidClipboard.getText() || '';
+    }catch(e){}
+  }
+
+  // Browser fallback
+  if(navigator.clipboard && navigator.clipboard.readText){
+    try{
+      return await navigator.clipboard.readText();
+    }catch(e){}
+  }
+
+  return '';
+}
+
+pasteBtn.onclick=async()=>{
+  pasteBtn.disabled=true;
+  try{
+    const value=(await readClipboardText()).trim();
+
+    if(!value){
+      showStatus('剪贴板里没有可粘贴的内容。','err');
+      return;
+    }
+
+    // Replace old content completely with latest clipboard content.
+    txt.value=value;
+    status.className='card hidden';
+    result.className='card hidden';
+    result.innerHTML='';
+    txt.focus();
+  }finally{
+    pasteBtn.disabled=false;
+  }
+};
+
 
 function appDownload(url, filename){
   const absolute=new URL(url,location.href).href;

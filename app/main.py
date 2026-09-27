@@ -17,7 +17,7 @@ from playwright.async_api import async_playwright
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 
-app = FastAPI(title="Video Collector", version="3.2")
+app = FastAPI(title="Video Collector", version="3.3")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 URL_RE = re.compile(r'https?://[^\s<>"\']+', re.I)
@@ -1985,7 +1985,7 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "version": "3.2"}
+    return {"ok": True, "version": "3.3"}
 
 
 @app.post("/api/parse")
