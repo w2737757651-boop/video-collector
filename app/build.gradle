@@ -1,0 +1,19 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.videocollector.app'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.videocollector.app"
+        minSdk 23
+        targetSdk 35
+        versionCode 3
+        versionName "3.0"
+    }
+}
+
+dependencies {
+}
