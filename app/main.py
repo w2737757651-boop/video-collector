@@ -16,7 +16,7 @@ from yt_dlp import YoutubeDL
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 
-app = FastAPI(title="Video Collector", version="2.8")
+app = FastAPI(title="Video Collector", version="2.9")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 URL_RE = re.compile(r'https?://[^\s<>"\']+', re.I)
@@ -458,63 +458,145 @@ async def verify_video_resource(url: str, referer: str | None = None) -> bool:
         return False
 
 
+def _xhs_unwrap(value):
+    """
+    Xiaohongshu SSR data may wrap reactive values in:
+      {"_value": ...}
+      {"value": ...}
+    Unwrap a few layers safely.
+    """
+    current = value
+
+    for _ in range(6):
+        if not isinstance(current, dict):
+            break
+
+        if "_value" in current and len(current) <= 4:
+            current = current.get("_value")
+            continue
+
+        if "value" in current and len(current) <= 4:
+            current = current.get("value")
+            continue
+
+        break
+
+    return current
+
+
+def _xhs_find_note_detail_map(state):
+    """
+    Search the entire initial state recursively for noteDetailMap
+    instead of assuming a fixed top-level path.
+    """
+    visited = set()
+
+    def walk(obj):
+        obj = _xhs_unwrap(obj)
+
+        obj_id = id(obj)
+        if obj_id in visited:
+            return None
+        visited.add(obj_id)
+
+        if isinstance(obj, dict):
+            if "noteDetailMap" in obj:
+                candidate = _xhs_unwrap(obj.get("noteDetailMap"))
+                if isinstance(candidate, dict) and candidate:
+                    return candidate
+
+            for value in obj.values():
+                found = walk(value)
+                if found is not None:
+                    return found
+
+        elif isinstance(obj, list):
+            for value in obj:
+                found = walk(value)
+                if found is not None:
+                    return found
+
+        return None
+
+    return walk(state)
+
+
 def _xhs_find_note_container(state, target_note_id=None):
     """
-    Locate the exact note from noteDetailMap.
-    Prefer the note id extracted from the resolved share URL instead of
-    blindly taking the first object in noteDetailMap.
+    Locate the exact note from any noteDetailMap found in SSR state.
+    Handles reactive wrappers such as _value/value.
     """
-    if not isinstance(state, dict):
-        return None, None
+    detail_map = _xhs_find_note_detail_map(state)
 
-    note_root = state.get("note")
-    if not isinstance(note_root, dict):
-        return None, None
-
-    detail_map = note_root.get("noteDetailMap")
     if not isinstance(detail_map, dict) or not detail_map:
         return None, None
 
+    # Exact map key first.
     if target_note_id:
-        # Exact map key
-        container = detail_map.get(target_note_id)
-        if isinstance(container, dict) and isinstance(container.get("note"), dict):
-            return str(target_note_id), container["note"]
+        direct = _xhs_unwrap(detail_map.get(target_note_id))
 
-        # Exact id inside note object
-        for map_key, container in detail_map.items():
-            if not isinstance(container, dict):
-                continue
-            note = container.get("note")
-            if not isinstance(note, dict):
-                continue
-            nid = str(
-                note.get("noteId")
-                or note.get("id")
-                or map_key
-                or ""
-            )
-            if nid == str(target_note_id):
-                return str(map_key), note
+        if isinstance(direct, dict):
+            note = _xhs_unwrap(direct.get("note"))
 
-    # Fallback only if exactly one real note exists
+            if isinstance(note, dict):
+                return str(target_note_id), note
+
     valid = []
+
     for map_key, container in detail_map.items():
+        container = _xhs_unwrap(container)
+
         if not isinstance(container, dict):
             continue
-        note = container.get("note")
-        if isinstance(note, dict):
-            valid.append((str(map_key), note))
 
+        note = _xhs_unwrap(container.get("note"))
+
+        # Some payloads may store the note object directly.
+        if not isinstance(note, dict):
+            maybe_note = _xhs_unwrap(container)
+
+            if isinstance(maybe_note, dict) and (
+                "video" in maybe_note
+                or "noteId" in maybe_note
+                or "id" in maybe_note
+            ):
+                note = maybe_note
+
+        if not isinstance(note, dict):
+            continue
+
+        nid = str(
+            note.get("noteId")
+            or note.get("id")
+            or map_key
+            or ""
+        )
+
+        valid.append((str(map_key), note, nid))
+
+        if target_note_id and nid == str(target_note_id):
+            return str(map_key), note
+
+    # If only one note was returned, use it.
     if len(valid) == 1:
-        return valid[0]
+        map_key, note, _ = valid[0]
+        return map_key, note
 
-    # Prefer a video note if multiple objects are present
-    for map_key, note in valid:
-        if str(note.get("type") or "").lower() == "video" and isinstance(note.get("video"), dict):
+    # Prefer an explicit video note among multiple records.
+    for map_key, note, _ in valid:
+        note_type = str(note.get("type") or "").lower()
+
+        if note_type == "video" and isinstance(
+            _xhs_unwrap(note.get("video")),
+            dict
+        ):
             return map_key, note
 
-    return (valid[0] if valid else (None, None))
+    if valid:
+        map_key, note, _ = valid[0]
+        return map_key, note
+
+    return None, None
 
 
 
@@ -530,22 +612,22 @@ def extract_xhs_structured_video(state, target_note_id=None):
     note_id, note = _xhs_find_note_container(state, target_note_id)
 
     if not note:
-        raise ValueError("没有找到小红书 noteDetailMap 笔记详情数据。")
+        raise ValueError("页面存在 __INITIAL_STATE__，但递归搜索后仍未找到 noteDetailMap。该页面可能返回了简化 SSR 数据，或缺少有效 xsec_token。")
 
     note_type = str(note.get("type") or "").lower()
 
     # Some responses may omit explicit type but still contain video data.
-    video = note.get("video")
+    video = _xhs_unwrap(note.get("video"))
     if not isinstance(video, dict):
         if note_type and note_type != "video":
             raise ValueError("当前小红书笔记不是视频笔记。")
         raise ValueError("小红书笔记存在，但没有找到 video 节点。")
 
-    media = video.get("media")
+    media = _xhs_unwrap(video.get("media"))
     if not isinstance(media, dict):
         raise ValueError("找到小红书 video 节点，但缺少 media 数据。")
 
-    stream = media.get("stream")
+    stream = _xhs_unwrap(media.get("stream"))
     if not isinstance(stream, dict):
         raise ValueError("找到小红书 video.media，但缺少 stream 数据。")
 
@@ -553,7 +635,7 @@ def extract_xhs_structured_video(state, target_note_id=None):
 
     # Prefer H264 for widest playback/download compatibility.
     for codec_key in ("h264", "h265", "hevc"):
-        items = stream.get(codec_key)
+        items = _xhs_unwrap(stream.get(codec_key))
         if not isinstance(items, list):
             continue
 
@@ -1442,7 +1524,7 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "version": "2.8"}
+    return {"ok": True, "version": "2.9"}
 
 
 @app.post("/api/parse")
