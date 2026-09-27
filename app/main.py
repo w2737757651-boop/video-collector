@@ -19,7 +19,7 @@ from playwright.async_api import async_playwright
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 
-app = FastAPI(title="Video Collector", version="4.1")
+app = FastAPI(title="Video Collector", version="4.1.1")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 _PARSE_CACHE = {}
@@ -956,180 +956,180 @@ async def parse_xhs_with_browser(source_url: str):
 
     page = await context.new_page()
 
-        async def block_heavy_assets(route):
+    async def block_heavy_assets(route):
+        try:
+            rtype = route.request.resource_type
+            low = route.request.url.lower()
+            if rtype in ("image", "font", "stylesheet"):
+                await route.abort()
+                return
+            if any(t in low for t in ("adserver", "/ads/", "analytics", "sensorsdata", "collect?")):
+                await route.abort()
+                return
+            await route.continue_()
+        except Exception:
             try:
-                rtype = route.request.resource_type
-                low = route.request.url.lower()
-                if rtype in ("image", "font", "stylesheet"):
-                    await route.abort()
-                    return
-                if any(t in low for t in ("adserver", "/ads/", "analytics", "sensorsdata", "collect?")):
-                    await route.abort()
-                    return
                 await route.continue_()
             except Exception:
-                try:
-                    await route.continue_()
-                except Exception:
-                    pass
+                pass
 
-        await page.route("**/*", block_heavy_assets)
+    await page.route("**/*", block_heavy_assets)
 
-        page.on(
-            "request",
-            lambda req: maybe_add(req.url)
+    page.on(
+        "request",
+        lambda req: maybe_add(req.url)
+    )
+
+    try:
+        await page.goto(
+            source_url,
+            wait_until="domcontentloaded",
+            timeout=9000,
         )
 
-        try:
-            await page.goto(
-                source_url,
-                wait_until="domcontentloaded",
-                timeout=9000,
+        # Let client-side hydration/network requests complete.
+        await page.wait_for_timeout(1200)
+
+        final_url = page.url
+
+        low_final = final_url.lower()
+
+        if (
+            "/login" in low_final
+            or "captcha" in low_final
+            or "/404" in low_final
+        ):
+            raise ValueError(
+                "小红书浏览器访问被跳转到登录、验证码或限制页面。"
+                "本工具不会绕过验证。"
             )
 
-            # Let client-side hydration/network requests complete.
-            await page.wait_for_timeout(1200)
+        # Read hydrated state directly from browser JS context.
+        state = await page.evaluate(
+            """() => {
+                try {
+                    return window.__INITIAL_STATE__ || null;
+                } catch (e) {
+                    return null;
+                }
+            }"""
+        )
 
-            final_url = page.url
+        target_note_id = (
+            _xhs_note_id_from_url(final_url)
+            or _xhs_note_id_from_url(source_url)
+        )
 
-            low_final = final_url.lower()
+        structured = None
 
-            if (
-                "/login" in low_final
-                or "captcha" in low_final
-                or "/404" in low_final
+        if isinstance(state, dict):
+            try:
+                structured = extract_xhs_structured_video(
+                    state,
+                    target_note_id=target_note_id,
+                )
+            except Exception:
+                structured = None
+
+        # DOM <video> is a useful fallback after hydration.
+        dom_video_urls = await page.evaluate(
+            """() => Array.from(document.querySelectorAll('video'))
+                .map(v => v.currentSrc || v.src || '')
+                .filter(Boolean)"""
+        )
+
+        for u in dom_video_urls or []:
+            maybe_add(u)
+
+        # Also inspect <source> children.
+        dom_source_urls = await page.evaluate(
+            """() => Array.from(document.querySelectorAll('video source'))
+                .map(s => s.src || '')
+                .filter(Boolean)"""
+        )
+
+        for u in dom_source_urls or []:
+            maybe_add(u)
+
+        candidates = []
+
+        if structured:
+            candidates.extend(
+                structured.get("videos") or []
+            )
+
+        for url in captured:
+            if all(
+                item.get("url") != url
+                for item in candidates
             ):
-                raise ValueError(
-                    "小红书浏览器访问被跳转到登录、验证码或限制页面。"
-                    "本工具不会绕过验证。"
-                )
+                candidates.append({
+                    "quality": "浏览器视频源",
+                    "url": url,
+                    "ext": (
+                        "m3u8"
+                        if ".m3u8" in url.lower()
+                        else "mp4"
+                    ),
+                    "width": None,
+                    "height": None,
+                })
 
-            # Read hydrated state directly from browser JS context.
-            state = await page.evaluate(
-                """() => {
-                    try {
-                        return window.__INITIAL_STATE__ || null;
-                    } catch (e) {
-                        return null;
-                    }
-                }"""
+        verified = []
+
+        for item in candidates:
+            url = item.get("url")
+
+            if not url:
+                continue
+
+            if await verify_video_resource(
+                url,
+                referer=final_url,
+            ):
+                verified.append(item)
+
+        if not verified:
+            raise ValueError(
+                "浏览器已正常打开小红书页面，但没有捕获到可验证的视频流。"
+                "该笔记可能未向匿名网页端暴露视频地址，或当前 Render IP 被限流。"
             )
 
-            target_note_id = (
-                _xhs_note_id_from_url(final_url)
-                or _xhs_note_id_from_url(source_url)
-            )
+        title = None
+        author = None
+        cover = None
+        duration = None
+        note_id = target_note_id
 
-            structured = None
+        if structured:
+            title = structured.get("title")
+            author = structured.get("author")
+            cover = structured.get("cover")
+            duration = structured.get("duration")
+            note_id = structured.get("note_id") or note_id
 
-            if isinstance(state, dict):
-                try:
-                    structured = extract_xhs_structured_video(
-                        state,
-                        target_note_id=target_note_id,
-                    )
-                except Exception:
-                    structured = None
+        if not title:
+            try:
+                title = await page.title()
+            except Exception:
+                title = None
 
-            # DOM <video> is a useful fallback after hydration.
-            dom_video_urls = await page.evaluate(
-                """() => Array.from(document.querySelectorAll('video'))
-                    .map(v => v.currentSrc || v.src || '')
-                    .filter(Boolean)"""
-            )
+        return {
+            "platform": "XiaoHongShu",
+            "id": note_id,
+            "title": title or "小红书视频",
+            "author": author,
+            "cover": cover,
+            "duration": duration,
+            "source_url": source_url,
+            "resolved_url": final_url,
+            "referer": final_url,
+            "videos": verified[:12],
+            "resolver": "browser",
+        }
 
-            for u in dom_video_urls or []:
-                maybe_add(u)
-
-            # Also inspect <source> children.
-            dom_source_urls = await page.evaluate(
-                """() => Array.from(document.querySelectorAll('video source'))
-                    .map(s => s.src || '')
-                    .filter(Boolean)"""
-            )
-
-            for u in dom_source_urls or []:
-                maybe_add(u)
-
-            candidates = []
-
-            if structured:
-                candidates.extend(
-                    structured.get("videos") or []
-                )
-
-            for url in captured:
-                if all(
-                    item.get("url") != url
-                    for item in candidates
-                ):
-                    candidates.append({
-                        "quality": "浏览器视频源",
-                        "url": url,
-                        "ext": (
-                            "m3u8"
-                            if ".m3u8" in url.lower()
-                            else "mp4"
-                        ),
-                        "width": None,
-                        "height": None,
-                    })
-
-            verified = []
-
-            for item in candidates:
-                url = item.get("url")
-
-                if not url:
-                    continue
-
-                if await verify_video_resource(
-                    url,
-                    referer=final_url,
-                ):
-                    verified.append(item)
-
-            if not verified:
-                raise ValueError(
-                    "浏览器已正常打开小红书页面，但没有捕获到可验证的视频流。"
-                    "该笔记可能未向匿名网页端暴露视频地址，或当前 Render IP 被限流。"
-                )
-
-            title = None
-            author = None
-            cover = None
-            duration = None
-            note_id = target_note_id
-
-            if structured:
-                title = structured.get("title")
-                author = structured.get("author")
-                cover = structured.get("cover")
-                duration = structured.get("duration")
-                note_id = structured.get("note_id") or note_id
-
-            if not title:
-                try:
-                    title = await page.title()
-                except Exception:
-                    title = None
-
-            return {
-                "platform": "XiaoHongShu",
-                "id": note_id,
-                "title": title or "小红书视频",
-                "author": author,
-                "cover": cover,
-                "duration": duration,
-                "source_url": source_url,
-                "resolved_url": final_url,
-                "referer": final_url,
-                "videos": verified[:12],
-                "resolver": "browser",
-            }
-
-        finally:
-            await context.close()
+    finally:
+        await context.close()
 
 
 async def parse_xiaohongshu(source_url: str):
@@ -2059,7 +2059,7 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "version": "4.1"}
+    return {"ok": True, "version": "4.1.1"}
 
 
 @app.post("/api/parse")
